@@ -1,0 +1,20 @@
+{"wasdi_initialisation_file" :"/home/louis_snyders/Private/PycharmProjects/Aries_Ecostress/config/wasdi_configuration_file.json",
+ "workspaces": ["Ecostress simultaneous with S3 for 35JLM",
+                "Ecostress simultaneous with S3 for 35JMM",
+                "Ecostress simultaneous with S3 for 35JNM"
+ ],
+
+  "validation_folder" : "/vitodata/aries/validation_data/south_africa",
+  "validation_satellite": "Ecostress",
+  "senet_folder": "/vitodata/aries/south_africa/",
+
+
+  "include_SESA" : true,
+  "include_VZA_difference": true,
+  "generate_csv": true,
+  "generate_all_data_csv": true,
+  "generate_difference_geotiff": false,
+  "skip_processed" : true,
+
+ "number_of_csv_samples": 5
+}
