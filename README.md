@@ -12,3 +12,5 @@ In addition to the LST sharpening as developed within Sen4ET, here we have added
 All scripts required to compute these correction coefficients can be found in "corrections_ecostress" folder, located in the scripts folder.
 
 At the end of the main script, all required files are prepared to upload the final results to the food security TEP platform. 
+
+Actual data upload can be done using the "upload_fstep.py" script, located in the "scripts" folder.
