@@ -19,15 +19,17 @@ from sen_et_openeo.utils.meteo import (comp_air_temp_inputs,
                                        comp_air_temp)
 from sen_et_openeo.ts import TimeSeriesProcessor, _TimeSeriesTimer
 
-ERA5_BANDS_DICT = {25000: ['t2m', 'z', 'd2m', 'sp', 'v100',
-                           'u100', 'ssrdc', 'ssrd']}
+ERA5_BANDS_DICT = {25000: ['t2m', 'z', 'd2m', 'sp',
+                           #    'v100', 'u100', 'ssrdc', 'ssrd'
+                           ]}
 ERA5_BANDS_DICT_DOWNLOAD = ["2m_temperature", "z",
                             "2m_dewpoint_temperature",
                             "surface_pressure",
-                            "100m_v_component_of_wind",
-                            "100m_u_component_of_wind",
-                            "surface_solar_radiation_downward_clear_sky",
-                            "surface_solar_radiation_downwards"]
+                            # "100m_v_component_of_wind",
+                            # "100m_u_component_of_wind",
+                            # "surface_solar_radiation_downward_clear_sky",
+                            # "surface_solar_radiation_downwards"
+                            ]
 
 
 def get_default_rsi_meta():
@@ -245,7 +247,12 @@ class ERA5TimeSeriesProcessor(TimeSeriesProcessor):
                 self.collection.df.day == datestr].path.values[0]
             ncfile = netCDF4.Dataset(ecmwf_data_file, 'r')
             # Find the location of bracketing dates
-            nctime = ncfile.variables['time']
+            if 'time' in ncfile.variables:
+                nctime = ncfile.variables['time']
+            elif 'valid_time' in ncfile.variables:
+                nctime = ncfile.variables['valid_time']
+            else:
+                raise ValueError('No time variable found in ERA5 file!')
             nctimes = netCDF4.num2date(
                 nctime[:], nctime.units, nctime.calendar)
             beforeI, afterI, frac = _bracketing_dates(nctimes, t)
