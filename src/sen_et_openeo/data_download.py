@@ -76,8 +76,10 @@ class SenETDownload:
                      "viewAzimuthAngles", "viewZenithAngles", 'lat', 'lon']
     JOB_OPTIONS_S2 = {
         "executor-memory": "4G",
-        "executor-memoryOverhead": "4G",
+        "executor-memoryOverhead": "5G",
         "executor-cores": "1",
+        "driver-memory": "4G",
+        "driver-memoryOverhead": "6G",
     }
     JOB_OPTIONS_S3 = {
         "executor-memory": "4G",
@@ -407,7 +409,7 @@ class SenETDownload:
                         "<datetime>": "<Path>",
                         "...": "..."
                     },
-                    "SCL": {
+                    "NDVI": {
                         "<datetime>": "<Path>",
                         "...": "..."
                     }
@@ -1179,36 +1181,44 @@ class SenETDownload:
             eoconn = openeo.connect(
                 type(self).OPENEO_CDSE_URL).authenticate_oidc()
 
+        cube_properties = {"eo:cloud_cover": lambda val: val <= 95.0}
+
         s2_bands = eoconn.load_collection(
             self.name_s2,
             temporal_extent=self._temporal_extent,
             spatial_extent=self._spatial_extent,
-            bands=type(self).S2_BAND_NAMES + ["SCL"],
+            bands=type(self).S2_BAND_NAMES,
+            properties=cube_properties
         ).resample_spatial(resolution=20)
 
         # SCL masking
         if self._s2_should_mask:
-            erode_r = 3
-            dilate_r = 13
-            s2_bands = s2_bands.process(
-                "mask_scl_dilation",
-                data=s2_bands,
+
+            # load SCL band
+            scl_cube = eoconn.load_collection(
+                collection_id="SENTINEL2_L2A",
+                bands=["SCL"],
+                temporal_extent=self._temporal_extent,
+                spatial_extent=self._spatial_extent,
+                properties=cube_properties)
+
+            # Compute the SCL dilation mask
+            scl_dilated_mask = scl_cube.process(
+                "to_scl_dilation_mask",
+                data=scl_cube,
                 scl_band_name="SCL",
-                mask1_values=[2, 4, 5, 6, 7],  # Pixels to keep
-                mask2_values=[3, 8, 9, 10, 11],  # Pixels to remove
-                kernel1_size=0,  # Dilation for pixels to keep.
-                kernel2_size=dilate_r,  # Dilation for pixels to remove.
-                erosion_kernel_size=erode_r,
-            )
+                kernel1_size=9,
+                kernel2_size=39,
+                mask1_values=[2, 4, 5, 6, 7],
+                mask2_values=[3, 8, 9, 10, 11],
+                erosion_kernel_size=3,
+            ).rename_labels("bands", ["S2-L2A-SCL_DILATED_MASK"])
+
+            s2_bands = s2_bands.mask(scl_dilated_mask)
 
         # Compute NDVI as well
-        ndvi = (s2_bands.band("B08") - s2_bands.band("B04")) / \
-            (s2_bands.band("B08") + s2_bands.band("B04"))
-        # ndvi = ndvi.add_dimesion("bands", "NDVI", "bands")
-        # s2_bands = s2_bands.merge_cubes(ndvi)
-        s2_bands_ndvi = s2_bands.merge_cubes(ndvi)
-        s2_bands_ndvi = s2_bands_ndvi.rename_labels(
-            'bands', s2_bands.metadata.band_names + ['NDVI'])
+        s2_bands_ndvi = s2_bands.ndvi(nir='B08', red='B04',
+                                      target_band='NDVI')
 
         # Dekadal compositing
         if self._s2_should_composite:
@@ -1408,8 +1418,8 @@ class SenETDownload:
         scale = 0.0001
         offset = 0
 
-        scales = [scale] * 10 + [1, 1]
-        offsets = [offset] * 10 + [0, 0]
+        scales = [scale] * 10 + [1]
+        offsets = [offset] * 10 + [0]
 
         for f in filelist:
             with rasterio.open(f, "r+") as handler:
@@ -1595,7 +1605,11 @@ class SenETDownload:
                 file paths as values.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
-        xar_in = rioxarray.open_rasterio(input_file)
+        try:
+            xar_in = rioxarray.open_rasterio(input_file)
+        except KeyError:
+            xar_in = xr.open_dataset(input_file)
+
         epsg = None
         if xar_in.rio.crs is None:
             # Assume 'EPSG:4326'
@@ -1621,6 +1635,7 @@ class SenETDownload:
                     data = data_array.sel(t=t)
                     if data.dtype == 'float64' and force_f32:
                         data = data.astype('float32')
+                    t = pd.Timestamp(t)
                     str_date = t.strftime('%Y%m%dT%H%M%SZ')
                     output_file = output_dir / f"{name}-{str_date}.tif"
                     data.rio.write_crs(epsg, inplace=True)
@@ -1647,6 +1662,7 @@ class SenETDownload:
             output_dict[name_y] = dict()
 
             for t in xar_in['t'].values:
+                t = pd.Timestamp(t)
                 str_date = t.strftime('%Y%m%dT%H%M%SZ')
 
                 output_file_x = output_dir / f"{name_x}-{str_date}.tif"
