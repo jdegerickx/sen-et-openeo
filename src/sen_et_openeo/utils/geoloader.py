@@ -402,11 +402,19 @@ def _getECMWFTempInterpData(ncfile, var_name, before_I, after_I, frac):
     # Read the right time layers
     try:
         data_before = ds.GetRasterBand(before_I+1).ReadAsArray()
-        data_before = (data_before.astype(float) * scale) + offset
-        data_before[data_before == no_data_value] = np.nan
+        if scale is not None:
+            data_before = data_before.astype(float) * scale
+        if offset is not None:
+            data_before = data_before + offset
+        if ~np.isnan(no_data_value):
+            data_before[data_before == no_data_value] = np.nan
         data_after = ds.GetRasterBand(after_I+1).ReadAsArray()
-        data_after = (data_after.astype(float) * scale) + offset
-        data_after[data_after == no_data_value] = np.nan
+        if scale is not None:
+            data_after = data_after.astype(float) * scale
+        if offset is not None:
+            data_after = data_after + offset
+        if ~np.isnan(no_data_value):
+            data_after[data_after == no_data_value] = np.nan
     except AttributeError:
         ds = None
         raise RuntimeError(
