@@ -1,3 +1,68 @@
+# INSTRUCTIONS FOR UPLOADING DATA TO FOOD SECURITY EXPLORER PLATFORM
+
+# STEP 1: Prepare your GeoTIFFs to be uploaded
+# (this step is taken care of by sen-et-openeo workflow)
+# o	For better performance, first, you need to transform all your TIF files
+#   to COG (cloud-optimized GeoTIFF).
+# o	Ensure that all GeoTIFF files have a CRS (coordinate reference system).
+# o	Place all GeoTIFF files in their own dedicated directory (only these files
+#   and nothing extra).
+
+# STEP 2: Fill the CSV table
+# (this step is taken care of by sen-et-openeo workflow)
+# o	Once you have all files prepared and in a dedicated directory/folder,
+#   take the csv-example.csv table (attached) and fill it.
+#   Since you are uploading only GeoTIFFs, the geometry column does not
+#   need to be filled.
+#   For every file, you need the fields (columns) startTime, endTime,
+#   filename, and description.
+# o	IMPORTANT: save the file with ; as field separator and  not ,
+
+# STEP 3: Create a collection on FOOD SECURITY EXPLORER PLATFORM
+# o	Create a collection in the FSX-DAMA UI
+#   (https://foodsecurity-tep.ope.insula.earth/dama).
+#   To do this, you have to log in,
+#   then go to DAMA/Data Discovery/My Storage/Uploaded Data/.
+# o	Click on the button "New folder"
+#   (it has an icon of a folder with a plus sign + inside).
+# o	Add a name and description. For data type, use generic.
+
+# STEP 4: Prepare your access credentials and paths
+# o	Get the env_example.txt file (located in the same folder as this script)
+#   and rename it to .env
+# o	Add your FSX-API credentials in this file.
+#   The variables you need to change/add are USERNAME, PASSWORD,
+#   COLLECTION_NAME (defined in step 3), PATH_TO_CSV (see step 2),
+#   FILES_INPUT_DIR (see step 1).
+
+# STEP 5: Prepare your Python environment
+#   (this step is taken care of if you have set up a python environment
+#   using the requirements.txt located within this repository)
+# o	Create a new Python virtual environment.
+# o	Install all needed packages defined in the attached file requirements.txt
+#   (e.g., $ pip install -r requirements.txt).
+
+# STEP 6: Execute the script
+# o	Monitor the upload. The script will output the files that were uploaded.
+# o	If debugging is needed, use the automatically generated log file
+#   upload-collection-files.log for more information.
+#   This file is generated in the same directory where the Python script
+#   was executed.
+
+# NOTE: In case the upload procedure is interrupted, remove the already
+# uploaded files from the CSV file and start the script again.
+
+# STEP 7: Check data on FSX-DAMA
+# o	Once the upload has finished successfully, you can go back to the web UI
+#   and check your data. All geo-files should be georeferenced and can be
+#   searched by time, name, and AOI.
+
+# STEP 8: Share GeoTIFF styles
+# o	If you want to have the GeoTIFF files with specific styles,
+#   please export the style in the SLD (Styled Layer Descriptor) using QGIS.
+# o	Share the SLD file with Food Security Explorer administrator.
+
+
 import os
 import requests
 from lxml import html
@@ -10,7 +75,6 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 import pandas as pd
 import json
 
-# NOTE: run this script with "fstep" conda environment !!
 
 # load env variables
 load_dotenv("./.env")
