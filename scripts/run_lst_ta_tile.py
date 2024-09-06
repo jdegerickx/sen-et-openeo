@@ -105,7 +105,7 @@ def compute_lst_ta(lst_file, time, elev_file, time_zone,
 
 def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
          residual_correction=False, corr_parameters=None,
-         parallel_jobs=True, delete_tmp_data=False):
+         parallel_jobs=False, delete_tmp_data=False):
 
     logger.info('** Downloading data from OpenEO')
     data_download = SenETDownload(tile, temporal_extent)
@@ -207,18 +207,21 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
 
 if __name__ == "__main__":
 
-    tiles = ['34HBH']
-    temporal_extent = ["2019-07-01", "2019-07-20"]
-    output_dir = Path('/vitodata/aries/s-africa_test')
-    era5_tiled_folder = Path('/data/beresilient/ERA5')
-    time_zone = 0
+    # NOTE that in order to avoid processing issues, the temporal extent
+    # should be limited to a maximum of 6 months.
 
-    # # MALI
-    # tiles = ['30QVD', '30QWD']
-    # temporal_extent = ['2023-06-01', '2024-06-30']
-    # output_dir = Path('/vitodata/aries/Mali')
-    # era5_tiled_folder = Path('/vitodata/aries/data/ERA5')
+    # tiles = ['34HBH']
+    # temporal_extent = ["2019-07-01", "2019-07-20"]
+    # output_dir = Path('/vitodata/aries/s-africa_test')
+    # era5_tiled_folder = Path('/data/beresilient/ERA5')
     # time_zone = 0
+
+    # MALI
+    tiles = ['30QWD']
+    temporal_extent = ['2023-10-01', '2024-01-31']
+    output_dir = Path('/vitodata/aries/Mali_4')
+    era5_tiled_folder = Path('/vitodata/aries/data/ERA5')
+    time_zone = 0
 
     # # ZAMBIA
     # tiles = ['35LPD']
