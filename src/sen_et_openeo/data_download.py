@@ -189,7 +189,6 @@ class SenETDownload:
 
     def download(self,
                  output_dir: Path,
-                 output_format: Literal['netcdf', 'gtiff'] = 'gtiff',
                  parallel: bool = True) -> Dict[str, any]:
         """
         Download datacubes from specified sources.
@@ -200,9 +199,6 @@ class SenETDownload:
         Args:
             output_dir (Path): The directory where downloaded datacubes
             will be saved.
-            output_format (Literal['netcdf', 'gtiff'], optional): The
-            format in which datacubes will be downloaded.
-                Defaults to 'gtiff'.
             parallel (bool, optional): Whether to download datacubes
             in parallel. Defaults to True.
 
@@ -341,7 +337,7 @@ class SenETDownload:
 
                 self._log.info(f'Execute OpenEO job {name}')
                 batch_job: BatchJob = self._execute_datacube(
-                    datacube, output_format, name, job_id, job_opts)
+                    datacube, fmt, name, job_id, job_opts)
                 self._log.info(f'OpenEO {name} finished...')
                 output_files = self._download_job_result(
                     batch_job, output_path, output_format=fmt, name=name)
