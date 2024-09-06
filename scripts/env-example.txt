@@ -1,4 +1,4 @@
-FSX_API_HOST=https://foodsecurity-tep.ope.insula.earth/secure/api/v2.0
+FSX_API_HOST=https://foodsecurity-explorer.ope.insula.earth/secure/api/v2.0
 REALM=foodsecurity-tep
 KEYCLOAK_JWKS_URL=https://identity.ope.insula.earth/realms/foodsecurity-tep/protocol/openid-connect/certs
 KEYCLOAK_URL=https://identity.ope.insula.earth/
