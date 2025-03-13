@@ -8,8 +8,8 @@ import netCDF4
 import datetime
 import copy
 
-from satio.timeseries import Timeseries
-from satio.collections import DiskCollection
+from sen_et_openeo.utils.timeseries import Timeseries
+from sen_et_openeo.utils.collections import DiskCollection
 
 from sen_et_openeo.utils.geoloader import (_getECMWFTempInterpData,
                                            _getECMWFIntegratedData)
@@ -17,7 +17,7 @@ from sen_et_openeo.utils.warping import warp_in_memory
 from sen_et_openeo.utils.timedate import _bracketing_dates
 from sen_et_openeo.utils.meteo import (comp_air_temp_inputs,
                                        comp_air_temp)
-from sen_et_openeo.ts import TimeSeriesProcessor, _TimeSeriesTimer
+from sen_et_openeo.ts import TimeSeriesProcessor
 
 ERA5_BANDS_DICT = {25000: ['t2m', 'z', 'd2m', 'sp',
                            #    'v100', 'u100', 'ssrdc', 'ssrd'
@@ -192,7 +192,6 @@ class ERA5TimeSeriesProcessor(TimeSeriesProcessor):
     def __init__(self, timestamps, elev, demfile, time_zone,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.timer = _TimeSeriesTimer(25000)
 
         self.timestamps = timestamps
         self.elev = elev

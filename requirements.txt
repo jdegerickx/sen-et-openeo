@@ -78,7 +78,6 @@ rio-cogeo==5.3.3
 rioxarray==0.17.0
 ruff==0.5.0
 s3transfer==0.10.2
-satio==1.1.17
 scikit-image==0.24.0
 scikit-learn==1.5.1
 scipy==1.14.1

@@ -5,9 +5,25 @@ from osgeo import gdal
 from osgeo import osr
 import netCDF4
 import datetime
+import xarray as xr
 
-from satio.geoloader import ParallelLoader
-from satio.utils.geotiff import (get_rasterio_profile,
+import random
+from typing import List
+import concurrent.futures
+
+from loguru import logger
+
+from tqdm.auto import tqdm
+
+import numpy as np
+import xarray as xr
+
+from rasterio.errors import RasterioIOError
+
+from skimage.transform import rescale
+
+
+from sen_et_openeo.utils.geotiff import (get_rasterio_profile,
                                  write_geotiff_tags)
 
 from sen_et_openeo.utils.timedate import _bracketing_dates
@@ -130,6 +146,275 @@ OUTPUT_SCALING = {
 }
 
 DEM_FEATURES = ['DEM-alt-20m', 'DEM-asp-20m', 'DEM-slo-20m']
+
+L2A_10M_BANDS = ['AOT', 'B02', 'B03', 'B04', 'B08', 'TCI', 'WVP']
+
+
+class ParallelLoader:
+
+    def __init__(self,
+                 max_workers=20,
+                 progressbar=False,
+                 rio_gdal_options=None,
+                 fill_value=0,
+                 random_order=True):
+
+        self._max_workers = max_workers
+        self._progressbar = progressbar
+
+        if rio_gdal_options is None:
+            rio_gdal_options = {'GDAL_CACHEMAX': 0}
+
+        self._rio_gdal_options = rio_gdal_options
+        self._fill_value = fill_value
+        self._random_order = random_order
+
+    def _load_array_bounds(self, fname, bounds):
+
+        with rasterio.Env(**self._rio_gdal_options):
+            with rasterio.open(fname) as src:
+                window = rasterio.windows.from_bounds(*bounds, src.transform)
+
+                vals = np.array(window.flatten())
+                if (vals % 1 > 0).any():
+
+                    # logger.warning("Rounding floating window"
+                    #                "offsets and shape")
+                    window = (window
+                              .round_lengths(op='ceil')
+                              .round_offsets(op='floor'))
+
+                arr = src.read(window=window, boundless=True,
+                               fill_value=self._fill_value)
+
+        arr = arr[0]
+        return arr
+
+    def _load_array_bounds_safe(self, fname, bounds, max_retries=50):
+        """
+        to be tested
+        """
+        with rasterio.Env(**self._rio_gdal_options):
+            with rasterio.open(fname) as src:
+                window = rasterio.windows.from_bounds(*bounds, src.transform)
+
+                try:
+                    arr = src.read(window=window, boundless=True,
+                                   fill_value=self._fill_value)
+                    arr = np.squeeze(arr)
+
+                except RasterioIOError as e:
+                    if max_retries:
+                        logger.error(f"Error reading data from {fname}: {e}"
+                                     " Retrying")
+                        return self._load_array_bounds_safe(fname,
+                                                            bounds,
+                                                            max_retries - 1)
+                    else:
+                        logger.error(f"Error reading data from {fname}: {e}"
+                                     " Returning an array of zeros.")
+                        arr = np.zeros((window.height, window.width))
+
+        return arr
+
+    def load_arrays(self, filenames, bounds):
+
+        def f_handle(filename):
+            return self._load_array_bounds(filename, bounds)
+
+        if self._random_order:
+            ids = list(range(len(filenames)))
+            ids_random = ids.copy()
+            random.shuffle(ids_random)
+            ids_map = [ids_random.index(i) for i in ids]
+            filenames = [filenames[i] for i in ids_random]
+
+        arrs_list = self._run_parallel(f_handle,
+                                       filenames,
+                                       self._max_workers,
+                                       threads=True,
+                                       progressbar=self._progressbar)
+
+        if self._random_order:
+            arrs_list = [arrs_list[i] for i in ids_map]
+
+        return arrs_list
+
+    def _load_raw(self, collection, bands, resolution=10):
+
+        bounds = collection.bounds
+
+        filenames = [f for band in bands
+                     for f in collection.get_band_filenames(band, resolution)]
+
+        arrs_list_flat = self.load_arrays(filenames, bounds)
+
+        arrs_list = self._split_arrs_list(arrs_list_flat,
+                                          n_bands=len(bands))
+
+        return arrs_list
+
+    def _split_arrs_list(self,
+                         arrs: List[np.ndarray],
+                         n_bands: int) -> List[np.ndarray]:
+        """
+        'arrs' is a list of arrays with shape [y, x] loaded from filenames.
+        The length of the list should be n_bands * n_timestamps.
+        This function returns a list of leght n_bands with arrays of shape
+        [n_timestamps, y, x].
+        """
+        n_timestamps = len(arrs) // n_bands
+        if len(arrs) % n_bands:
+            raise ValueError("Number of files loaded is not a multiple "
+                             "of the number of bands as expected.")
+
+        out_list = [np.array(arrs[n_timestamps * i:n_timestamps * (i + 1)])
+                    for i in range(n_bands)]
+
+        return out_list
+
+    def load(self, collection, bands, resolution, resample=False):
+        """
+        Load data for the given bands. resolution should be 10 or 20.
+        If resolution is 10, only 'B02', 'B03', 'B04' and 'B08' will be
+        loaded at 10 m resolution, the rest at 20 m. Unless 'resample' is
+        set to True. In that case, 20 m bands will be upsampled to 10 m with
+        a bilinear filter (except 'SCL' which will be resampled with
+        nearest neighbors method).
+        """
+        if not isinstance(bands, (list, tuple)):
+            raise TypeError("'bands' should be a list/tuple of bands. "
+                            f"Its type is: {type(bands)}")
+        if resolution not in [10, 20, 60]:
+            raise ValueError(f"Resolution value: '{resolution}' not supported"
+                             " Should be 10, 20 or 60.")
+
+        arrs_list = self._load_raw(collection, bands, resolution)
+
+        if resample:
+            arrs_list = self._resample(arrs_list, bands, resolution, order=1)
+
+        products = collection.products
+        timestamps = collection.timestamps
+        bands = list(bands)
+        bounds = list(collection.bounds)
+        epsg = collection.epsg
+
+        xds_dict = {band: self._arr_to_xarr(arrs_list[i],
+                                            bounds,
+                                            timestamps,
+                                            name=band)
+                    for i, band in enumerate(bands)}
+
+        xds_dict.update({'epsg': epsg,
+                         'bounds': bounds,
+                         'products': products,
+                         'bands': bands})
+        # xds = xr.Dataset(xds_dict)
+
+        return xds_dict
+
+    @staticmethod
+    def _run_parallel(f, my_iter, max_workers, threads=True, progressbar=True):
+
+        if threads:
+            Pool = concurrent.futures.ThreadPoolExecutor
+        else:
+            Pool = concurrent.futures.ProcessPoolExecutor
+
+        with Pool(max_workers=max_workers) as executor:
+            if progressbar:
+                results = list(
+                    tqdm(executor.map(f, my_iter), total=len(my_iter)))
+            else:
+                results = list(executor.map(f, my_iter))
+
+        return results
+
+    def _resample(self, arrs, bands, resolution, order=1):
+
+        if resolution == 20:
+            return arrs
+
+        elif resolution == 10:
+            new_arrs = []
+            for i, b in enumerate(bands):
+
+                arr = arrs[i]
+
+                if b not in L2A_10M_BANDS:
+                    scale = 2
+                    order = 0 if b == 'SCL' else order
+                    arr = self._resample_arr(arr, scale, order)
+
+                new_arrs.append(arr)
+        else:
+            raise NotImplementedError("Can only resample 10 m or 20 m bands"
+                                      "resolution.")
+
+        return new_arrs
+
+    @staticmethod
+    def _resample_arr(arr, scale, order):
+        dtype_ori = arr.dtype
+        arr = np.transpose(arr, [1, 2, 0])
+        arr = rescale(arr,
+                      scale=scale,
+                      order=order,
+                      preserve_range=True,
+                      multichannel=True,
+                      anti_aliasing=True)
+
+        arr = np.transpose(arr, [2, 0, 1])
+        arr = arr.astype(dtype_ori)
+
+        return arr
+
+    @staticmethod
+    def _arr_resolution(arr,
+                        bounds):
+
+        x_meters = bounds[2] - bounds[0]
+        return x_meters // arr.shape[-1]
+
+    def _arr_to_xarr(self,
+                     arr,
+                     bounds,
+                     timestamps,
+                     name=None):
+
+        if arr.ndim == 1:
+            # single pixel
+            arr = np.expand_dims(arr, axis=-1)
+            arr = np.expand_dims(arr, axis=-1)
+
+        resolution = self._arr_resolution(arr, bounds)
+
+        dims = ['timestamp', 'y', 'x']
+        dims = {k: arr.shape[i] for i, k in enumerate(dims)}
+
+        center_shift = resolution / 2
+        xmin, xmax = (bounds[0] + center_shift), (bounds[2] - center_shift)
+        ymin, ymax = (bounds[1] + center_shift), (bounds[3] - center_shift)
+
+        x = np.linspace(xmin,
+                        xmax,
+                        dims['x'])
+
+        y = np.linspace(ymin,
+                        ymax,
+                        dims['y'])
+
+        coords = {'timestamp': timestamps,
+                  'x': x, 'y': y}
+
+        da = xr.DataArray(arr,
+                          coords=coords,
+                          dims=dims,
+                          name=name,
+                          attrs={'resolution': resolution})
+
+        return da
 
 
 def GetExtent(gt, cols, rows):

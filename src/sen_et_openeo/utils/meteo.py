@@ -1,6 +1,6 @@
 import numpy as np
 
-from satio.timeseries import Timeseries
+from sen_et_openeo.utils.timeseries import Timeseries
 
 
 Z_BH = 100.0

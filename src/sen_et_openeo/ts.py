@@ -1,24 +1,6 @@
 from abc import ABC, abstractproperty
 
-from satio.rsindices import RSI_META
-from satio.utils import TaskTimer
-
-
-class _TimeSeriesTimer():
-
-    def __init__(self, *resolutions):
-
-        self.load = {}
-        self.rsi = {}
-        self.composite = {}
-        self.interpolate = {}
-
-        for r in resolutions:
-            self.load[r] = TaskTimer(f'{r}m loading')
-            self.rsi[r] = TaskTimer(f'{r}m rsi calculation')
-            self.composite[r] = TaskTimer(f'{r}m compositing')
-            self.interpolate[r] = TaskTimer(f'{r}m interpolation')
-
+from sen_et_openeo.utils.rsindices import RSI_META
 
 class TimeSeriesProcessor(ABC):
 

@@ -162,23 +162,23 @@ def plot_timeseries(shp_path, data_dir, tile,
 if __name__ == "__main__":
     # SCRIPT TO RUN
 
-    # Define the paths
-    shp_path = Path("/vitodata/aries/test_points_aktc.gpkg")
-    # data_dir = Path("/vitodata/aries/Zambia_2")
-    data_dir = Path("/vitodata/aries/Zambia_res-corr")
-    tile = "35LPD"
-    start_date = "2023-09-01"
-    end_date = "2024-07-31"
-
     # # Define the paths
-    # basedir = Path('/vitodata/aries/data/ref/ACF/ACF-Mali-Crop-Survey')
-    # tile = '30QVD'
-    # shp_path = str(basedir / 'Shape' /
-    #                f'SurvAgri_Tombouctou_Youwarou_Parcelles_drought_{tile}.gpkg')
-    # data_dir = Path("/vitodata/aries/Mali_4")
-    # start_date = "2023-06-01"
-    # end_date = "2024-04-15"
-    # outfile = str(basedir / 'Shape' /
-    #               'SurvAgri_Tombouctou_Youwarou_Parcelles_drought.gpkg')
+    # shp_path = Path("/vitodata/aries/test_points_aktc.gpkg")
+    # # data_dir = Path("/vitodata/aries/Zambia_2")
+    # data_dir = Path("/vitodata/aries/Zambia_res-corr")
+    # tile = "35LPD"
+    # start_date = "2023-09-01"
+    # end_date = "2024-07-31"
+
+    # Define the paths
+    basedir = Path('/vitodata/aries/data/ref/ACF/ACF-Mali-Crop-Survey')
+    tile = '30PUC'
+    shp_path = str(basedir / 'Shape' /
+                   f'SurvAgri_Tombouctou_Youwarou_Parcelles_drought_{tile}.gpkg')
+    data_dir = Path("/vitodata/aries/Mali")
+    start_date = "2023-06-01"
+    end_date = "2024-04-15"
+    outfile = str(basedir / 'Shape' /
+                  'SurvAgri_Tombouctou_Youwarou_Parcelles_drought.gpkg')
 
     plot_timeseries(shp_path, data_dir, tile, start_date, end_date)
