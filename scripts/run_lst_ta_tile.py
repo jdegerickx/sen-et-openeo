@@ -16,17 +16,21 @@
     """
 
 from pathlib import Path
+from pickle import TRUE
 import pandas as pd
 from loguru import logger
 import rasterio
 import numpy as np
 from rasterio.enums import Resampling
+from rasterio.warp import reproject, calculate_default_transform
+from scipy.constants import Stefan_Boltzmann as sigma
 import shutil
 
 from sen_et_openeo.data_download import SenETDownload
 from sen_et_openeo.era5 import (ERA5Collection,
                                 ERA5TimeSeriesProcessor,
                                 get_default_rsi_meta)
+from sen_et_openeo.tseb import compute_meteo_for_tseb, compute_et
 
 
 def get_era5_data(era5_tiled_folder, tile, temporal_extent):
@@ -69,14 +73,17 @@ def compute_lst_ta(lst_file, time, elev_file, time_zone,
     lst_data = lst_data * scale
     lst_data[lst_data == nodata] = np.nan
 
-    # Get the air temperature data from ERA5
+    # Get the air temperature data from ERA5.
+    # Use lst_file as the spatial reference template so that ERA5 T_A1 is
+    # resampled to the same grid as the LST (works for both the 20 m standard
+    # product and the 30 m LSTM-like product).
     meteo_settings = {'bands': ['t2m']}
     meteo_rsi_meta = get_default_rsi_meta().get('ERA5')
     elev = None
 
     meteo_ts = ERA5TimeSeriesProcessor([time],
                                        elev,
-                                       elev_file,
+                                       lst_file,
                                        time_zone,
                                        era5col,
                                        meteo_settings,
@@ -103,21 +110,213 @@ def compute_lst_ta(lst_file, time, elev_file, time_zone,
             (4, 8, 16), Resampling.average)
 
 
+def generate_lstm_like_lst(
+        sharpened_lst_file: Path,
+        vza_file: Path,
+        outfile: Path,
+        target_resolution: float = 30.0,
+        max_vza_deg: float = 30.0):
+    """Resample sharpened S3 LST from 20 m to an LSTM-like product at
+    ``target_resolution`` metres, masking pixels with VZA > ``max_vza_deg``.
+
+    Conversion path:
+        scaled LST → LST (K) → radiance (Stefan-Boltzmann)
+        → resample to 30 m (cubic spline)
+        → resample VZA to 30 m (nearest)
+        → mask VZA > max_vza_deg
+        → LST (K) [float32 GeoTIFF, nodata = -9999]
+
+    Parameters
+    ----------
+    sharpened_lst_file : Path
+        Sharpened LST at 20 m.  Scale factor is read from file metadata.
+    vza_file : Path
+        View Zenith Angle at 20 m (scaled int16, degrees after applying scale).
+    outfile : Path
+        Output GeoTIFF (float32, LST in Kelvin).
+    target_resolution : float
+        Target pixel size in metres. Default 30 m.
+    max_vza_deg : float
+        Maximum allowed VZA in degrees. Pixels above this are masked.
+        Default 30°.
+    """
+    _NODATA = -9999.0
+
+    # --- 1. Read LST and convert to Kelvin ---------------------------------
+    with rasterio.open(sharpened_lst_file) as src:
+        lst_raw = src.read(1).astype(np.float32)
+        src_nodata = src.nodata
+        lst_scale = src.scales[0] if src.scales else 0.01
+        src_transform = src.transform
+        src_crs = src.crs
+        src_height, src_width = src.height, src.width
+
+    lst_k = lst_raw * lst_scale
+    if src_nodata is not None:
+        lst_k[lst_raw == src_nodata] = np.nan
+
+    # --- 2. Convert to radiance (Stefan-Boltzmann: R = sigma * T^4) --------
+    radiance = np.full((src_height, src_width), _NODATA, dtype=np.float32)
+    valid = ~np.isnan(lst_k) & (lst_k > 0)
+    radiance[valid] = sigma * (lst_k[valid] ** 4)
+
+    # --- 3. Compute target grid at requested resolution --------------------
+    left = src_transform.c
+    top = src_transform.f
+    right = left + src_transform.a * src_width
+    bottom = top + src_transform.e * src_height  # transform.e is negative
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, src_crs, src_width, src_height,
+        left=left, bottom=bottom, right=right, top=top,
+        resolution=target_resolution,
+    )
+
+    # --- 4. Resample radiance to target resolution (cubic spline) ----------
+    radiance_30m = np.full((dst_height, dst_width), _NODATA, dtype=np.float32)
+    reproject(
+        source=radiance,
+        destination=radiance_30m,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        src_nodata=_NODATA,
+        dst_transform=dst_transform,
+        dst_crs=src_crs,
+        dst_nodata=_NODATA,
+        resampling=Resampling.cubic_spline,
+    )
+
+    # --- 5. Resample VZA to target resolution (nearest) -------------------
+    with rasterio.open(vza_file) as vsrc:
+        vza_raw = vsrc.read(1).astype(np.float32)
+        vza_scale = vsrc.scales[0] if vsrc.scales else 0.01
+        vza_nodata = vsrc.nodata
+        vza_transform = vsrc.transform
+        vza_crs = vsrc.crs
+
+    vza_deg = vza_raw * vza_scale
+    _VZA_NODATA = -9999.0
+    if vza_nodata is not None:
+        vza_deg[vza_raw == vza_nodata] = _VZA_NODATA
+
+    vza_30m = np.full((dst_height, dst_width), _VZA_NODATA, dtype=np.float32)
+    reproject(
+        source=vza_deg,
+        destination=vza_30m,
+        src_transform=vza_transform,
+        src_crs=vza_crs,
+        src_nodata=_VZA_NODATA,
+        dst_transform=dst_transform,
+        dst_crs=src_crs,
+        dst_nodata=_VZA_NODATA,
+        resampling=Resampling.nearest,
+    )
+
+    # --- 6. Apply VZA mask ------------------------------------------------
+    vza_bad = (vza_30m == _VZA_NODATA) | (vza_30m > max_vza_deg)
+    radiance_30m[vza_bad] = _NODATA
+
+    # --- 7. Convert radiance back to LST (K): T = (R / sigma)^(1/4) ------
+    lst_30m = np.full((dst_height, dst_width), _NODATA, dtype=np.float32)
+    valid_out = radiance_30m != _NODATA
+    lst_30m[valid_out] = (radiance_30m[valid_out] / sigma) ** 0.25
+
+    # --- 8. Write output --------------------------------------------------
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    out_profile = {
+        'driver': 'GTiff',
+        'dtype': 'float32',
+        'width': dst_width,
+        'height': dst_height,
+        'count': 1,
+        'crs': src_crs,
+        'transform': dst_transform,
+        'nodata': _NODATA,
+        'compress': 'deflate',
+    }
+    with rasterio.open(outfile, 'w', **out_profile) as dst:
+        dst.write(lst_30m, 1)
+        dst.update_tags(1, description='LST LSTM-like', units='K')
+
+
+def resample_to_match(src_file: Path, ref_file: Path, dst_file: Path,
+                      resampling: Resampling = Resampling.bilinear) -> Path:
+    """Reproject/resample *src_file* to exactly match the grid of *ref_file*.
+
+    Uses the CRS, transform, width and height of *ref_file* as the target.
+    Returns *dst_file* immediately if it already exists (lazy caching).
+    Preserves rasterio scale and description metadata from *src_file*.
+    """
+    dst_file = Path(dst_file)
+    if dst_file.exists():
+        return dst_file
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(ref_file) as ref:
+        dst_crs = ref.crs
+        dst_transform = ref.transform
+        dst_width = ref.width
+        dst_height = ref.height
+    with rasterio.open(src_file) as src:
+        src_data = src.read(1).astype(np.float32)
+        src_nodata = src.nodata
+        src_nd_out = src_nodata if src_nodata is not None else -9999.0
+        src_tr = src.transform
+        src_crs = src.crs
+        src_scales = src.scales
+        src_descriptions = src.descriptions
+    dst_data = np.full((dst_height, dst_width), src_nd_out, dtype=np.float32)
+    reproject(
+        source=src_data,
+        destination=dst_data,
+        src_transform=src_tr,
+        src_crs=src_crs,
+        src_nodata=src_nd_out,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=src_nd_out,
+        resampling=resampling,
+    )
+    dst_profile = {
+        'driver': 'GTiff',
+        'dtype': 'float32',
+        'width': dst_width,
+        'height': dst_height,
+        'count': 1,
+        'crs': dst_crs,
+        'transform': dst_transform,
+        'nodata': src_nd_out,
+        'compress': 'deflate',
+    }
+    with rasterio.open(dst_file, 'w', **dst_profile) as dst:
+        dst.write(dst_data, 1)
+        if src_scales:
+            dst.scales = src_scales
+        if src_descriptions:
+            dst.descriptions = src_descriptions
+    return dst_file
+
+
 def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
          residual_correction=False, corr_parameters=None,
-         parallel_jobs=False, delete_tmp_data=False):
+         parallel_jobs=False, delete_tmp_data=False,
+         generate_lstm_like=False, et_histogram=False,
+         compute_et_tseb=True,
+         min_valid_s3_fraction=0.0,
+         mask_to_s3_coverage=False):
 
     logger.info('** Downloading data from OpenEO')
     data_download = SenETDownload(tile, temporal_extent)
-    data_download.download(output_dir, output_format='gtiff',
-                           parallel=parallel_jobs)
+    data_download.download(output_dir,
+                           parallel=parallel_jobs) # output_format='gtiff',
 
     logger.info('** Preprocessing data')
     preprocess_dict = data_download.preprocess(
         output_dir, delete_unrequired_data=delete_tmp_data)
 
     logger.info('** Running LST sharpening algorithm')
-    sharpening_dict = data_download.sharpening(output_dir, residual_correction)
+    sharpening_dict = data_download.sharpening(
+        output_dir, residual_correction,
+        min_valid_fraction=min_valid_s3_fraction,
+        mask_to_s3_coverage=mask_to_s3_coverage)
 
     if corr_parameters is not None:
         logger.info('** Apply LST correction')
@@ -202,6 +401,144 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
     print(f'** Results saved in: {outdir}')
     print(f'** CSV file for FSTEP upload saved in: {outcsv}')
 
+    logger.info('** Computing ET with TSEB-PT model')
+    biopar_dict = {var: preprocess_dict[var]
+                   for var in SenETDownload.BIOPAR_VARIABLES}
+    worldcover_file = preprocess_dict[data_download.name_worldcover]
+    s3_dict = preprocess_dict['SENTINEL3_SLSTR_L2_LST']
+    outdir_et = output_dir / tile / '007_et'
+    outdir_meteo = outdir_et / 'meteo'
+    outdir_meteo.mkdir(parents=True, exist_ok=True)
+
+    meteo_cache = {}
+    if compute_et_tseb:
+        outdir_et.mkdir(parents=True, exist_ok=True)
+        outdir_meteo.mkdir(parents=True, exist_ok=True)
+
+        for t in timestamps:
+            timestr = t.strftime('%Y%m%dT%H%M%S')
+            et_file = outdir_et / f'TSEB-PT_{timestr}_{tile}.vrt'
+            if et_file.exists():
+                continue
+
+            meteo_paths = compute_meteo_for_tseb(
+                t, elev_file, time_zone, era5col, outdir_meteo)
+            meteo_cache[t] = meteo_paths
+
+            compute_et(
+                tile, t,
+                lst_file=lst_dict['LST'][t],
+                vza_file=s3_dict['viewZenithAnglesHR'][t],
+                lat_file=s3_dict['latHR'][t],
+                lon_file=s3_dict['lonHR'][t],
+                elev_file=elev_file,
+                biopar_dict=biopar_dict,
+                worldcover_file=worldcover_file,
+                meteo_paths=meteo_paths,
+                outdir=outdir_et,
+                time_zone=time_zone,
+                et_histogram=et_histogram,
+            )
+
+    if generate_lstm_like:
+        logger.info('** Generating LSTM-like 30 m LST product, LST-Ta and ET')
+        outdir_lstm = output_dir / tile / '008_lstm-like'
+        outdir_lstm.mkdir(parents=True, exist_ok=True)
+        outdir_ta_lstm = output_dir / tile / '008_lstm-ta'
+        outdir_ta_lstm.mkdir(parents=True, exist_ok=True)
+        outdir_et_lstm = output_dir / tile / '008_lstm-et'
+        outdir_et_lstm.mkdir(parents=True, exist_ok=True)
+        for t in timestamps:
+            timestr = t.strftime('%Y%m%dT%H%M%S')
+            lstm_out = outdir_lstm / f'LST-LSTM_{timestr}_{tile}.tif'
+            lstm_ta_file = outdir_ta_lstm / f'LST-Ta-LSTM_{timestr}_{tile}.tif'
+            lstm_et_file = outdir_et_lstm / f'TSEB-PT_{timestr}_{tile}.vrt'
+            if lstm_ta_file.exists() and lstm_et_file.exists():
+                continue
+            if not lstm_out.exists():
+                logger.info(f'  Generating LSTM-like LST: {timestr}')
+                generate_lstm_like_lst(
+                    sharpened_lst_file=lst_dict['LST'][t],
+                    vza_file=s3_dict['viewZenithAnglesHR'][t],
+                    outfile=lstm_out,
+                )
+            if not lstm_ta_file.exists():
+                compute_lst_ta(lstm_out, t, elev_file, time_zone,
+                               era5col, lstm_ta_file)
+            if not lstm_et_file.exists():
+                if t in meteo_cache:
+                    meteo_paths = meteo_cache[t]
+                else:
+                    meteo_paths = compute_meteo_for_tseb(
+                        t, elev_file, time_zone, era5col, outdir_meteo)
+
+                # All auxiliary inputs are at 20 m but the LSTM-like LST is
+                # at 30 m.  _process_tseb_tiled reads every input with the
+                # same pixel offsets as T_R1, so a resolution mismatch causes
+                # a spatial shift.  Resample everything to the 30 m grid
+                # of lstm_out before passing to compute_et.
+                inp30 = outdir_lstm / 'inputs_30m'
+                inp30.mkdir(parents=True, exist_ok=True)
+
+                # S3 geometry — nearest for angle/coord grids
+                vza_30m = resample_to_match(
+                    s3_dict['viewZenithAnglesHR'][t], lstm_out,
+                    inp30 / f'vza_{timestr}.tif',
+                    Resampling.nearest)
+                lat_30m = resample_to_match(
+                    s3_dict['latHR'][t], lstm_out,
+                    inp30 / f'lat_{timestr}.tif',
+                    Resampling.bilinear)
+                lon_30m = resample_to_match(
+                    s3_dict['lonHR'][t], lstm_out,
+                    inp30 / f'lon_{timestr}.tif',
+                    Resampling.bilinear)
+
+                # Static inputs — computed once, reused across timestamps
+                elev_30m = resample_to_match(
+                    elev_file, lstm_out,
+                    inp30 / 'elev.tif',
+                    Resampling.bilinear)
+                worldcover_30m = resample_to_match(
+                    worldcover_file, lstm_out,
+                    inp30 / 'worldcover.tif',
+                    Resampling.nearest)
+
+                # Biopar — resample all dates for all variables
+                biopar_dict_30m = {}
+                for var, date_paths in biopar_dict.items():
+                    biopar_dict_30m[var] = {}
+                    for bdate, bpath in date_paths.items():
+                        bdst = inp30 / (
+                            f'{var}_{bdate.strftime("%Y%m%d")}.tif')
+                        biopar_dict_30m[var][bdate] = resample_to_match(
+                            bpath, lstm_out, bdst, Resampling.bilinear)
+
+                # Meteo — resample all fields to 30 m
+                meteo_30m = {
+                    k: resample_to_match(
+                        v, lstm_out,
+                        inp30 / f'meteo_{timestr}_{k}.tif',
+                        Resampling.bilinear)
+                    for k, v in meteo_paths.items()
+                }
+
+                compute_et(
+                    tile, t,
+                    lst_file=lstm_out,
+                    vza_file=vza_30m,
+                    lat_file=lat_30m,
+                    lon_file=lon_30m,
+                    elev_file=elev_30m,
+                    biopar_dict=biopar_dict_30m,
+                    worldcover_file=worldcover_30m,
+                    meteo_paths=meteo_30m,
+                    outdir=outdir_et_lstm,
+                    time_zone=time_zone,
+                    biopar_cache_dir=outdir_lstm / 'biopar',
+                    et_histogram=et_histogram,
+                )
+
     logger.info('** All done!')
 
 
@@ -210,25 +547,12 @@ if __name__ == "__main__":
     # NOTE that in order to avoid processing issues, the temporal extent
     # should be limited to a maximum of 6 months.
 
-    # tiles = ['34HBH']
-    # temporal_extent = ["2019-07-01", "2019-07-20"]
-    # output_dir = Path('/vitodata/aries/s-africa_test')
-    # era5_tiled_folder = Path('/data/beresilient/ERA5')
-    # time_zone = 0
-
-    # MALI
-    tiles = ['30QWD']
-    temporal_extent = ['2023-10-01', '2024-01-31']
-    output_dir = Path('/vitodata/aries/Mali_4')
-    era5_tiled_folder = Path('/vitodata/aries/data/ERA5')
+    tiles = ['31UFS']
+    temporal_extent = ['2024-05-01', '2024-09-30']
+    output_dir = Path('/vitodata/CHILL_Y/OPENEO/31UFS/')
+    era5_tiled_folder = Path('/vitodata/CHILL_Y/data/ERA5')
     time_zone = 0
 
-    # # ZAMBIA
-    # tiles = ['35LPD']
-    # temporal_extent = ['2023-09-01', '2024-08-15']
-    # output_dir = Path('/vitodata/aries/Zambia_2')
-    # era5_tiled_folder = Path('/vitodata/aries/data/ERA5')
-    # time_zone = 2
 
     # NOTE: if residual correction is activated,
     # then the result of the sharpening
@@ -237,10 +561,29 @@ if __name__ == "__main__":
     residual_correction = False
     # parameters for bias + directional correction
     # if None, no correction is applied
-    corr_parameters = {"cross_cal_gain": 1.110024074017716,
-                       "cross_cal_offset": -33.008132822189395,
-                       "vinnikov_parameter": -7.547175199010964}
+    corr_parameters = None
+    # set to True to also produce a 30 m LSTM-like LST product
+    # (VZA > 30° masked, LST resampled via radiance space)
+    generate_lstm_like = True
+    # set to True to save a PNG histogram of ET_day next to each VRT
+
+    # set to False to skip the TSEB-PT ET computation entirely
+    compute_et_tseb = True
+    # — useful for a quick sanity check of the TSEB-PT output
+    et_histogram = True
+    # Minimum fraction of valid S3 pixels required to run sharpening.
+    # Scenes below this threshold are skipped (e.g. 0.05 = 5%).
+    # Set to 0.0 to keep the original behaviour (skip only fully-empty scenes).
+    min_valid_s3_fraction = 0.05
+    # If True, the sharpened LST is masked to only pixels where the original
+    # S3 observation was valid (no extrapolation outside S3 coverage).
+    mask_to_s3_coverage = False
 
     for tile in tiles:
         main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
-             residual_correction, corr_parameters)
+             residual_correction, corr_parameters,
+             generate_lstm_like=generate_lstm_like,
+             et_histogram=et_histogram,
+             compute_et_tseb=compute_et_tseb,
+             min_valid_s3_fraction=min_valid_s3_fraction,
+             mask_to_s3_coverage=mask_to_s3_coverage)
