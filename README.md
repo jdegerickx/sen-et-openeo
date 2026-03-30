@@ -68,24 +68,26 @@ Each step saves its results as a `.pkl` file so that a re-run automatically resu
 ### Step 0 — Download (`001_download/`)
 
 Data is downloaded from **CDSE via OpenEO**. All jobs can be launched in parallel.
-Results are stored in `001_download/` and catalogued in `download.pkl`.
+Results are stored in `001_download/` and catalogued in `download_<start>_<end>.pkl` (see [Temporal chunking](#temporal-chunking)).
 
 | Dataset | Collection | Format | Notes |
 |---|---|---|---|
 | Sentinel-2 L2A | `SENTINEL2_L2A` | GeoTIFF (multi-band) | Bands B02–B12 + NDVI; optional SCL dilation masking, dekadal compositing, linear temporal interpolation |
-| Sentinel-3 SLSTR LST | `SENTINEL3_SLSTR_L2_LST` | NetCDF | LST, LST_uncertainty, confidence_in, exception, sun/view angles; optional daytime/cloud filtering UDFs |
-| Copernicus DEM | `COPERNICUS_30` | GeoTIFF | Single temporal max composite |
-| ESA WorldCover | `ESA_WORLDCOVER_10M_2020_V1` or `_2021_V2` | GeoTIFF | Version chosen automatically based on start year (< 2021 → 2020 product) |
-| Biophysical vars | ESA-APEx `biopar` UDP | GeoTIFF | LAI, FAPAR, FCOVER — one OpenEO job per variable; optional dekadal compositing, linear temporal interpolation (same flags as S2/NDVI) |
+| Sentinel-3 SLSTR LST | `SENTINEL3_SLSTR_L2_LST` | NetCDF | LST, LST_uncertainty, confidence_in, exception, sun/view angles; optional daytime/cloud filtering UDFs. File is named `datacube_s3_<start>_<end>.nc` so different time chunks do not overwrite each other. |
+| Copernicus DEM | `COPERNICUS_30` | GeoTIFF | Single temporal max composite; shared across all time chunks |
+| ESA WorldCover | `ESA_WORLDCOVER_10M_2020_V1` or `_2021_V2` | GeoTIFF | Version chosen automatically based on start year (< 2021 → 2020 product); shared across all time chunks |
+| Biophysical vars | ESA-APEx `biopar` UDP | GeoTIFF | LAI, FAPAR, FCOVER — one OpenEO job per variable; optional dekadal compositing, linear temporal interpolation (same flags as S2/NDVI). **Skipped entirely when `compute_et_tseb = False`** to save time and compute credits. |
 
 After downloading, scale/offset metadata is written into the Sentinel-2 GeoTIFFs.
+
+When re-scanning an existing `001_download/` directory (no pkl present), the S2 and BIOPAR GeoTIFF file lists are filtered to only include dates that fall within the current `temporal_extent`, so files from a previous time chunk are never accidentally reused.
 
 ---
 
 ### Step 1 — Preprocess (`002_preprocess/`)
 
 Raw downloaded files are converted, spatially aligned and quality-flagged.
-Results are stored in `002_preprocess/` and catalogued in `preprocess.pkl`.
+Results are stored in `002_preprocess/` and catalogued in `preprocess_<start>_<end>.pkl`.
 
 #### Sub-steps
 
@@ -152,7 +154,22 @@ For each S3 acquisition:
 5. Optionally, a residual correction (block-level bias removal) is applied.
 6. Optionally, the sharpened LST is masked to the original S3 coverage (see below).
 
-Results are stored in `003_sharpening/` and catalogued in `sharpening.pkl`.
+Results are stored in `003_sharpening/` and catalogued in `sharpening_<start>_<end>_<params>.pkl`.
+
+#### Output filename encoding
+
+The sharpened LST filename encodes the two quality-control parameters so that runs with different settings produce distinct, non-conflicting files:
+
+```
+LST_SHARPENED_<timestamp>_minf<NNN>[_msk]_fin.tif
+```
+
+- `minf<NNN>` — minimum valid S3 fraction as a 3-digit integer percentage, e.g. `minf005` for `min_valid_s3_fraction = 0.05`.
+- `_msk` — appended when `mask_to_s3_coverage = True`.
+
+Examples:
+- `LST_SHARPENED_20240515T103000_minf005_msk_fin.tif` — 5% threshold, S3 mask applied
+- `LST_SHARPENED_20240515T103000_minf000_fin.tif` — no threshold, no mask (default behaviour)
 
 #### Sharpening quality controls
 
@@ -192,7 +209,7 @@ mask_to_s3_coverage = True
 If correction parameters are provided (`corr_parameters` dict), a bias and directionality correction is applied to the sharpened LST, correcting for systematic offsets and view-angle-dependent effects derived from ECOSTRESS intercomparison.
 If no parameters are provided this step is skipped and the sharpening output is used directly.
 
-Results are catalogued in `lst_correction.pkl`.
+Results are catalogued in `lst_correction_<start>_<end>.pkl`.
 
 ---
 
@@ -374,31 +391,56 @@ All output fields are written as individual compressed, tiled GeoTIFFs (float32,
 
 ---
 
+## Temporal chunking
+
+To avoid memory and processing issues, it is recommended to limit each run to a maximum of **6 months**. Each time chunk is fully independent: all `.pkl` cache files include the temporal extent in their filename (e.g. `download_20240501_20240630.pkl`), so switching `temporal_extent` in the `__main__` block never triggers an extent-mismatch error and never accidentally reuses cached results from a different period.
+
+**Running multiple chunks sequentially** (recommended):
+```python
+# Chunk 1
+temporal_extent = ['2024-05-01', '2024-06-30']
+# ... run script ...
+
+# Chunk 2  — just update the date range and re-run
+temporal_extent = ['2024-07-01', '2024-09-30']
+```
+
+Each chunk will:
+- Create its own pkl files (`download_20240701_20240930.pkl`, etc.).
+- Download its own S3 NetCDF (`datacube_s3_20240701_20240930.nc`).
+- Reuse DEM and WorldCover files (time-independent).
+- Skip already-processed per-date output files (`.tif`, `.vrt`) from any previous chunk.
+
+> **Parallel execution across tiles is safe** (each tile writes to its own subdirectory).  
+> **Parallel execution of two chunks on the same tile is risky** — there is no file locking, and shared output subdirectories (`005_lst-ta/`, `007_et/`, etc.) could be written to simultaneously.
+
+---
+
 ## Output directory structure
 
 ```
 <output_dir>/<tile>/
-├── download.pkl
-├── preprocess.pkl
-├── sharpening.pkl
-├── lst_correction.pkl          ← only if correction applied
-├── biopar.pkl
+├── download_<start>_<end>.pkl
+├── preprocess_<start>_<end>.pkl
+├── sharpening_<start>_<end>_<params>.pkl
+├── lst_correction_<start>_<end>.pkl  ← only if correction applied
+├── biopar_<start>_<end>.pkl          ← only if compute_et_tseb=True
 ├── 001_download/
-│   ├── S2/                     ← S2 multi-band GeoTIFFs
-│   ├── S3/                     ← S3 NetCDF file
-│   ├── DEM/                    ← DEM GeoTIFF
-│   ├── WorldCover/             ← WorldCover GeoTIFF
-│   └── BIOPAR/{LAI,FAPAR,FCOVER}/ ← warped in-place during Step 1
+│   ├── S2/                           ← S2 multi-band GeoTIFFs
+│   ├── S3/                           ← S3 NetCDF file per time chunk
+│   ├── DEM/                          ← DEM GeoTIFF (shared across chunks)
+│   ├── WorldCover/                   ← WorldCover GeoTIFF (shared)
+│   └── BIOPAR/{LAI,FAPAR,FCOVER}/    ← only when compute_et_tseb=True
 ├── 002_preprocess/
-│   ├── S2/                     ← per-band, per-date GeoTIFFs
-│   ├── S3/                     ← per-variable, per-date GeoTIFFs
-│   └── DEM/                    ← alt, slo, asp GeoTIFFs
-├── 003_sharpening/             ← sharpened LST at 20 m
-├── 004_lst-correction/         ← corrected LST (if applicable)
-├── 005_lst-ta/                 ← LST-Ta GeoTIFFs + CSV
-├── 006_ndvi/                   ← NDVI GeoTIFFs + CSV
-├── 007_et/                     ← TSEB-PT evapotranspiration VRTs
-├── 008_lstm-like/              ← LSTM-like 30 m LST GeoTIFFs (if enabled)
-├── 008_lstm-ta/                ← LST-Ta from LSTM-like LST (if enabled)
-└── 008_lstm-et/                ← TSEB-PT ET from LSTM-like LST (if enabled)
+│   ├── S2/                           ← per-band, per-date GeoTIFFs
+│   ├── S3/                           ← per-variable, per-date GeoTIFFs
+│   └── DEM/                          ← alt, slo, asp GeoTIFFs
+├── 003_sharpening/                   ← sharpened LST at 20 m
+├── 004_lst-correction/               ← corrected LST (if applicable)
+├── 005_lst-ta/                       ← LST-Ta GeoTIFFs + CSV
+├── 006_ndvi/                         ← NDVI GeoTIFFs + CSV
+├── 007_et/                           ← TSEB-PT evapotranspiration VRTs
+├── 008_lstm-like/                    ← LSTM-like 30 m LST GeoTIFFs (if enabled)
+├── 008_lstm-ta/                      ← LST-Ta from LSTM-like LST (if enabled)
+└── 008_lstm-et/                      ← TSEB-PT ET from LSTM-like LST (if enabled)
 ```
