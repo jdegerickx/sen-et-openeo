@@ -16,6 +16,7 @@ import geopandas as gpd
 
 from rasterio.crs import CRS
 
+import sen_et_openeo.layers
 from sen_et_openeo.utils.geoloader import ParallelLoader
 
 
@@ -294,8 +295,6 @@ class DiskCollection(BaseCollection):
     """
 
     def __init__(self, df, s2grid=None):
-
-        import sen_et_openeo
         
         if df.empty:
             df = self._empty_df()

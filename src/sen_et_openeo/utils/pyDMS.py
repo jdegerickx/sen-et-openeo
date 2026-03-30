@@ -357,9 +357,9 @@ class DecisionTreeSharpener(object):
                     scene_HR, quality_LR)
                 subsetQualityMask = subsetQuality_LR.GetRasterBand(
                     1).ReadAsArray()
-                qualityPix = np.in1d(subsetQualityMask.ravel(),
-                                     self.lowResGoodQualityFlags).reshape(
-                                         subsetQualityMask.shape)
+                qualityPix = np.isin(subsetQualityMask.ravel(),
+                                      self.lowResGoodQualityFlags).reshape(
+                                          subsetQualityMask.shape)
                 quality_LR = None
             else:
                 qualityPix = np.ones(data_LR.shape).astype(bool)
@@ -689,9 +689,9 @@ class DecisionTreeSharpener(object):
             subsetQuality_LR = utils.reprojectSubsetLowResScene(
                 downscaledScene, originalSceneQuality)
             goodPixMask_LR = subsetQuality_LR.GetRasterBand(1).ReadAsArray()
-            goodPixMask_LR = np.in1d(goodPixMask_LR.ravel(),
-                                     self.lowResGoodQualityFlags).reshape(
-                                         goodPixMask_LR.shape)
+            goodPixMask_LR = np.isin(goodPixMask_LR.ravel(),
+                                      self.lowResGoodQualityFlags).reshape(
+                                          goodPixMask_LR.shape)
             data_LR[~goodPixMask_LR] = np.nan
 
         # Then resample high res scene to low res pixel size
