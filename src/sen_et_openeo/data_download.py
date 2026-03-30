@@ -240,7 +240,8 @@ class SenETDownload:
 
     def download(self,
                  output_dir: Path,
-                 parallel: bool = True) -> Dict[str, any]:
+                 parallel: bool = True,
+                 download_biopar: bool = True) -> Dict[str, any]:
         """
         Download datacubes from specified sources.
         This method checks if data was already downloaded
@@ -252,6 +253,10 @@ class SenETDownload:
             will be saved.
             parallel (bool, optional): Whether to download datacubes
             in parallel. Defaults to True.
+            download_biopar (bool, optional): Whether to download
+            biophysical variables (LAI, FAPAR, FCOVER). Set to False
+            to skip BIOPAR downloads when ET computation is disabled.
+            Defaults to True.
 
         Returns:
             Dict[str, any]:
@@ -332,7 +337,7 @@ class SenETDownload:
              'gtiff',
              self.worldcover_jobid,
              type(self).JOB_OPTIONS_WORLDCOVER),
-        ] + [
+        ] + ([
             (f'BIOPAR_{var}',
              lambda v=var: self._get_datacube_biopar(v),
              output_dir / 'BIOPAR' / var,
@@ -340,7 +345,7 @@ class SenETDownload:
              None,
              type(self).JOB_OPTIONS_BIOPAR)
             for var in type(self).BIOPAR_VARIABLES
-        ]
+        ] if download_biopar else [])
         # If (part of) the data is already downloaded,
         # load the dictionary from the pickle file (if present),
         # then also scan output directories for any files already on disk.

@@ -306,7 +306,8 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
     logger.info('** Downloading data from OpenEO')
     data_download = SenETDownload(tile, temporal_extent)
     data_download.download(output_dir,
-                           parallel=parallel_jobs) # output_format='gtiff',
+                           parallel=parallel_jobs,
+                           download_biopar=compute_et_tseb)  # output_format='gtiff',
 
     logger.info('** Preprocessing data')
     preprocess_dict = data_download.preprocess(
@@ -565,11 +566,12 @@ if __name__ == "__main__":
     # set to True to also produce a 30 m LSTM-like LST product
     # (VZA > 30° masked, LST resampled via radiance space)
     generate_lstm_like = True
-    # set to True to save a PNG histogram of ET_day next to each VRT
+
 
     # set to False to skip the TSEB-PT ET computation entirely
     compute_et_tseb = True
     # — useful for a quick sanity check of the TSEB-PT output
+    # set to True to save a PNG histogram of ET_day next to each VRT    
     et_histogram = True
     # Minimum fraction of valid S3 pixels required to run sharpening.
     # Scenes below this threshold are skipped (e.g. 0.05 = 5%).
