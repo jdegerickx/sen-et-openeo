@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, Union, Dict, Callable, List
 import gc
+import sys
 try:
     from typing import Literal
 except ImportError:
@@ -69,8 +70,9 @@ class SenETDownload:
     # OPENEO_CDSE_URL = "openeo-staging.dataspace.copernicus.eu"
     S2_BAND_NAMES = ["B02", "B03", "B04", "B05",
                      "B06", "B07", "B08", "B8A", "B11", "B12"]
-    S3_BAND_NAMES = ["LST", "LST_uncertainty", "exception", "confidence_in",
-                     "sunAzimuthAngles", "sunZenithAngles",
+    S3_BAND_NAMES1 = ["LST", "LST_uncertainty", "exception", "confidence_in"
+                        ]
+    S3_BAND_NAMES2 = [ "sunAzimuthAngles", "sunZenithAngles",
                      "viewAzimuthAngles", "viewZenithAngles"]
     S3_WARP_TO_HR = ["sunAzimuthAngles", "sunZenithAngles",
                      "viewAzimuthAngles", "viewZenithAngles", 'lat', 'lon']
@@ -93,6 +95,18 @@ class SenETDownload:
         "executor-cores": "1",
     }
 
+    # ESA WorldCover — version depends on the acquisition year of the data:
+    #   before 2021  → ESA_WORLDCOVER_10M_2020_V1  (product year 2020)
+    #   2021 onward  → ESA_WORLDCOVER_10M_2021_V2  (product year 2021)
+    WORLDCOVER_2020 = 'ESA_WORLDCOVER_10M_2020_V1'
+    WORLDCOVER_2021 = 'ESA_WORLDCOVER_10M_2021_V2'
+    WORLDCOVER_CUTOFF_YEAR = 2021   # first year that uses the 2021 product
+    JOB_OPTIONS_WORLDCOVER = {
+        "executor-memory": "4G",
+        "executor-memoryOverhead": "2G",
+        "executor-cores": "1",
+    }
+
     DOWNLOAD_RETRIES = 3  # Retry count when data is not available
     RETRY_DELAY = 30  # In seconds
 
@@ -110,6 +124,19 @@ class SenETDownload:
                          'S2-B05', 'S2-B06', 'S2-B07',
                          'S2-B08', 'S2-B11', 'S2-B12',
                          'DEM-alt-20m', 'S3-inc']
+
+    # Biophysical variables (biopar) for PyTSEB
+    BIOPAR_VARIABLES = ["LAI", "FAPAR", "FCOVER"]
+    BIOPAR_UDP_URL = ("https://raw.githubusercontent.com/ESA-APEx/"
+                     "apex_algorithms/refs/heads/main/algorithm_catalog/"
+                     "vito/biopar/openeo_udp/biopar.json")
+    JOB_OPTIONS_BIOPAR = {
+        "executor-memory": "7G",
+        "executor-memoryOverhead": "5G",
+        "executor-cores": "1",
+        "driver-memory": "4G",
+        "driver-memoryOverhead": "6G",
+    }
 
     # TODO: should be configurable in the instance itself.
     NUM_THREADS_GDAL = 'ALL_CPUS'
@@ -161,12 +188,20 @@ class SenETDownload:
         self.name_s3 = 'SENTINEL3_SLSTR_L2_LST'
         self.name_dem = 'COPERNICUS_30'
 
+        # Choose WorldCover product version based on temporal extent start year
+        start_year = int(str(temporal_extent[0])[:4])
+        if start_year < type(self).WORLDCOVER_CUTOFF_YEAR:
+            self.name_worldcover = type(self).WORLDCOVER_2020
+        else:
+            self.name_worldcover = type(self).WORLDCOVER_2021
+
         self.delete_temp = True
 
         # Set these values to provide jobid's
         self.s2_jobid: Optional[str] = None
         self.s3_jobid: Optional[str] = None
         self.dem_jobid: Optional[str] = None
+        self.worldcover_jobid: Optional[str] = None
 
         # store download results here from download():
         self._download_results: Optional[dict] = None
@@ -174,12 +209,28 @@ class SenETDownload:
         self._preprocess_results: Optional[dict] = None
         # Store sharpening results here from sharpening():
         self._sharpening_results: Optional[dict] = None
+        # Store LST correction results here from lst_correction():
+        self._lst_results: Optional[dict] = None
+        # Store biophysical variable results here from compute_biopar():
+        self._biopar_results: Optional[dict] = None
 
         # See https://gdal.org/programs/gdalwarp.html#cmdoption-gdalwarp-r
         self.warp_resampling_method: str = 'near'
 
         # # Quick and dirty method to prompt the user with a single login url
         # openeo.connect(type(self).OPENEO_URL).authenticate_oidc()
+
+    @property
+    def _temporal_pkl_suffix(self) -> str:
+        """Short string encoding the temporal extent for use in pkl filenames.
+
+        Ensures that runs with different temporal extents (e.g. time chunks)
+        produce separate pkl files and never trigger the extent-mismatch error.
+        Example: temporal_extent=['2024-05-01','2024-06-30'] → '_20240501_20240630'
+        """
+        start = str(self._temporal_extent[0]).replace('-', '')[:8]
+        end   = str(self._temporal_extent[1]).replace('-', '')[:8]
+        return f'_{start}_{end}'
 
     def run(self, output_dir):
         self.download(output_dir)
@@ -237,7 +288,7 @@ class SenETDownload:
                 }
        """
         # Path where the output_dict is pickled at the end:
-        output_dict_pkl = output_dir / self.tile / 'download.pkl'
+        output_dict_pkl = output_dir / self.tile / f'download{self._temporal_pkl_suffix}.pkl'
 
         # Set output dir
         output_dir = output_dir / self.tile / '001_download'
@@ -245,7 +296,10 @@ class SenETDownload:
 
         # Set output paths
         output_path_s2 = output_dir / 'S2'
-        output_path_s3 = output_dir / 'S3' / 'datacube_s3.nc'
+        output_path_s3 = (
+            output_dir / 'S3'
+            / f'datacube_s3{self._temporal_pkl_suffix}.nc'
+        )
         output_path_dem = output_dir / 'DEM'
 
         # Define datacubes to download
@@ -271,24 +325,103 @@ class SenETDownload:
              'gtiff',
              self.dem_jobid,
              type(self).JOB_OPTIONS_DEM),
+
+            (self.name_worldcover,
+             self._get_datacube_worldcover,
+             output_dir / 'WorldCover',
+             'gtiff',
+             self.worldcover_jobid,
+             type(self).JOB_OPTIONS_WORLDCOVER),
+        ] + [
+            (f'BIOPAR_{var}',
+             lambda v=var: self._get_datacube_biopar(v),
+             output_dir / 'BIOPAR' / var,
+             'gtiff',
+             None,
+             type(self).JOB_OPTIONS_BIOPAR)
+            for var in type(self).BIOPAR_VARIABLES
         ]
         # If (part of) the data is already downloaded,
-        # load and return the dictionary from the pickle file
-        to_download = [name for name, datacube_func, output_path,
-                       fmt, job_id, job_opts in datacubes]
+        # load the dictionary from the pickle file (if present),
+        # then also scan output directories for any files already on disk.
+        all_names = [name for name, datacube_func, output_path,
+                     fmt, job_id, job_opts in datacubes]
         if output_dict_pkl.is_file():
-            self._log.info('Data already downloaded. Loading results.')
+            self._log.info('Pickle file found. Loading previous results.')
             self._download_results = self._check_and_load_pickled_dict(
                 output_dict_pkl, output_dir)
-            to_download = [n for n in to_download if n not in
-                           list(self._download_results.keys())]
-            datacubes = [dc for dc in datacubes if dc[0] in to_download]
-            if len(datacubes) == 0:
-                return self._download_results
-
         else:
             # Setup the result dict, set some initial values
             self._download_results = self._get_initial_output_dict()
+
+        # Temporal window for filtering existing GeoTIFF files by date.
+        # Only files whose embedded date falls within [t_start, t_end] are
+        # considered as already-downloaded for this temporal chunk.
+        t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        t_end   = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+
+        def _filter_tifs_by_extent(tif_list):
+            """Keep only tif files whose date (from filename) is within
+            [t_start, t_end]. Files without a parseable date are kept."""
+            _pat = re.compile(
+                r'.*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z?\.tif',
+                re.I)
+            filtered = []
+            for f in tif_list:
+                m = _pat.match(f.name)
+                if m:
+                    fdate = datetime(
+                        int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    if t_start <= fdate <= t_end:
+                        filtered.append(f)
+                else:
+                    filtered.append(f)  # no date in name → keep
+            return filtered
+
+        # Additionally check the output directories for existing files,
+        # even when they are not (yet) recorded in the pickle file.
+        for name, datacube_func, output_path, fmt, job_id, job_opts in datacubes:
+            if name in self._download_results:
+                # Already tracked; ensure output_files list is populated.
+                entry = self._download_results[name]
+                if 'output_files' not in entry or not entry['output_files']:
+                    op = entry.get('output_path', output_path)
+                    if fmt == 'gtiff' and op and Path(op).is_dir():
+                        entry['output_files'] = _filter_tifs_by_extent(
+                            sorted(Path(op).glob('*.tif')))
+                    elif fmt == 'netcdf' and op and Path(op).is_file():
+                        entry['output_files'] = [Path(op)]
+            else:
+                # Not in pickle; check whether files are already on disk.
+                if fmt == 'gtiff' and output_path.is_dir():
+                    existing_files = _filter_tifs_by_extent(
+                        sorted(output_path.glob('*.tif')))
+                    if existing_files:
+                        self._log.info(
+                            f'{name}: found {len(existing_files)} existing '
+                            f'file(s) in {output_path}. Skipping download.')
+                        self._download_results[name] = {
+                            'output_path': output_path,
+                            'fmt': fmt,
+                            'output_files': existing_files}
+                elif fmt == 'netcdf' and output_path.is_file():
+                    self._log.info(
+                        f'{name}: found existing file {output_path}. '
+                        f'Skipping download.')
+                    self._download_results[name] = {
+                        'output_path': output_path,
+                        'fmt': fmt,
+                        'output_files': [output_path]}
+
+        to_download = [n for n in all_names
+                       if n not in self._download_results]
+        datacubes = [dc for dc in datacubes if dc[0] in to_download]
+
+        if len(datacubes) == 0:
+            self._log.info('All data already available. Returning results.')
+            return self._download_results
 
         ##################################################################
         # STEP1: Process and download data from OpenEO                   #
@@ -504,7 +637,7 @@ class SenETDownload:
             }
         """
 
-        output_dict_pkl = output_dir / self.tile / 'preprocess.pkl'
+        output_dict_pkl = output_dir / self.tile / f'preprocess{self._temporal_pkl_suffix}.pkl'
         output_dir = output_dir / self.tile / '002_preprocess'
 
         # If the data is already preprocessed,
@@ -548,7 +681,8 @@ class SenETDownload:
                                         force_f32=True)
 
         # Split the different bands of the sentinel2 file. Save as geotiff
-        output_files_s2 = self._download_results[self.name_s2]['output_files']
+        output_files_s2 = self._download_results[self.name_s2][
+            'output_files']
         output_dir_s2 = output_dir / 'S2'
         self._preprocess_results[self.name_s2] = type(
             self)._split_geotiff_s2(output_files_s2, output_dir_s2)
@@ -594,6 +728,47 @@ class SenETDownload:
         for var_name, f_in in self._preprocess_results[self.name_dem].items():
             type(self).reference_warp_gdal(f_in, ref_ds=s2_ref_file)
 
+        # Preprocess biopar: copy to preprocess dir, then align to S2 grid.
+        # Files are copied first (like WorldCover) so that:
+        #   - the original download files are never modified, and
+        #   - re-running preprocess is idempotent.
+        for var in type(self).BIOPAR_VARIABLES:
+            key = f'BIOPAR_{var}'
+            if key in self._download_results:
+                biopar_files = self._download_results[key]['output_files']
+                biopar_src_dict = type(self)._create_output_dict_gtiff(
+                    biopar_files)
+                biopar_dst_dir = output_dir / 'BIOPAR' / var
+                biopar_dst_dir.mkdir(parents=True, exist_ok=True)
+                biopar_date_dict = dict()
+                self._log.info(
+                    f'Copying and aligning {var} biopar to S2 reference grid')
+                for f_date, f_src in biopar_src_dict.items():
+                    f_dst = biopar_dst_dir / f_src.name
+                    if not f_dst.exists():
+                        shutil.copy2(f_src, f_dst)
+                    type(self).reference_warp_gdal(f_dst, ref_ds=s2_ref_file)
+                    biopar_date_dict[f_date] = f_dst
+                self._preprocess_results[var] = biopar_date_dict
+
+        # Preprocess WorldCover: warp single GeoTIFF to S2 20m reference grid
+        if self.name_worldcover in self._download_results:
+            wc_files = self._download_results[self.name_worldcover][
+                'output_files']
+            if wc_files:
+                wc_src = wc_files[0]
+                wc_dst = (output_dir / 'WorldCover'
+                          / wc_src.name)
+                wc_dst.parent.mkdir(parents=True, exist_ok=True)
+                if not wc_dst.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(wc_src, wc_dst)
+                self._log.info(
+                    f'Warping WorldCover to S2 reference grid ({wc_dst.name})')
+                type(self).reference_warp_gdal(
+                    wc_dst, ref_ds=s2_ref_file, resampling='mode')
+                self._preprocess_results[self.name_worldcover] = wc_dst
+
         ##################################################################
         # STEP3: Generate quality_flags                                  #
         ##################################################################
@@ -614,7 +789,8 @@ class SenETDownload:
         # Remove unnecessary data to save disk space and resources
         # before the sharpening step
         if delete_unrequired_data:
-            s3_required = ('LST', 'inc', 'quality_flag', 'viewZenithAnglesHR')
+            s3_required = ('LST', 'inc', 'quality_flag',
+                           'viewZenithAnglesHR', 'latHR', 'lonHR')
             s2_required = type(self).S2_SHARP_INPUTS
             s2_required.append('NDVI')
             dem_required = ('alt',)
@@ -674,9 +850,19 @@ class SenETDownload:
         return self._preprocess_results
 
     def sharpening(self, output_dir: Path,
-                   residual_correction: bool = False):
+                   residual_correction: bool = False,
+                   min_valid_fraction: float = 0.0,
+                   mask_to_s3_coverage: bool = False):
 
-        output_dict_pkl = output_dir / self.tile / 'sharpening.pkl'
+        # Build a suffix encoding the filtering/masking parameters so that
+        # runs with different settings produce distinct output files and
+        # pickles and do not collide with each other.
+        _minf_pct = int(round(min_valid_fraction * 100))
+        _file_suffix = f'_minf{_minf_pct:03d}'
+        if mask_to_s3_coverage:
+            _file_suffix += '_msk'
+
+        output_dict_pkl = output_dir / self.tile / f'sharpening{self._temporal_pkl_suffix}{_file_suffix}.pkl'
         output_dir = output_dir / self.tile / '003_sharpening'
         tmp_dir = output_dir / 'tmp'
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -708,14 +894,85 @@ class SenETDownload:
         # for each s3 date, get closest available s2 observation
         for s3_date in s3_dates:
             output_file = output_dir / \
-                f'LST_SHARPENED_{s3_date.strftime("%Y%m%dT%H%M%S")}.tif'
+                f'LST_SHARPENED_{s3_date.strftime("%Y%m%dT%H%M%S")}{_file_suffix}.tif'
             output_fin = Path(str(output_file).replace('.tif', '_fin.tif'))
+
+            # Stable reference to the original S3 LST — do NOT use lowres_file
+            # for this purpose because it gets overwritten inside the
+            # BlockHelper loop further below.
+            s3_lst_file = s3_data['LST'][s3_date]
+
             if output_fin.is_file():
                 output_files[s3_date] = output_fin
                 self._log.info(f'{s3_date} already processed. ({output_fin})')
+                if mask_to_s3_coverage:
+                    self._log.info(
+                        f'{s3_date}: (Re-)applying S3 coverage mask '
+                        f'to existing file.')
+                    with rasterio.open(s3_lst_file) as _s3:
+                        _s3_arr = _s3.read(1)
+                        _s3_nd = (
+                            _s3.nodata if _s3.nodata is not None else 0)
+                        _s3_valid = (
+                            _s3_arr != _s3_nd).astype(np.uint8)
+                        _s3_tr = _s3.transform
+                        _s3_crs = _s3.crs
+                    with rasterio.open(output_fin) as _fin:
+                        _fin_profile = _fin.profile.copy()
+                        _fin_scales = _fin.scales
+                        _fin_descriptions = _fin.descriptions
+                        _fin_units = _fin.units
+                        _fin_data = _fin.read(1)
+                        _fin_nodata = _fin.nodata
+                        _fin_tr = _fin.transform
+                        _fin_crs = _fin.crs
+                        _fin_h = _fin.height
+                        _fin_w = _fin.width
+                    _s3_valid_hr = np.zeros(
+                        (_fin_h, _fin_w), dtype=np.uint8)
+                    rasterio.warp.reproject(
+                        source=_s3_valid,
+                        destination=_s3_valid_hr,
+                        src_transform=_s3_tr,
+                        src_crs=_s3_crs,
+                        dst_transform=_fin_tr,
+                        dst_crs=_fin_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    _fin_data[_s3_valid_hr == 0] = _fin_nodata
+                    with rasterio.open(
+                            output_fin, 'w', **_fin_profile) as _dst:
+                        _dst.scales = _fin_scales
+                        _dst.descriptions = _fin_descriptions
+                        _dst.units = _fin_units
+                        _dst.write(_fin_data, 1)
+                        _dst.build_overviews(
+                            (4, 8, 16), Resampling.average)
                 continue
 
             # start processing...
+            # Early-exit if the LST raster is entirely nodata / empty
+            # (e.g. fully clouded scene) to avoid wasting time building
+            # the VRT and training the sharpener on zero pixels.
+            # Also skip if the fraction of valid S3 pixels is below the
+            # user-defined minimum threshold (min_valid_fraction).
+            lowres_file = s3_data['LST'][s3_date]
+            with rasterio.open(lowres_file) as _chk:
+                _lst_chk = _chk.read(1)
+                _nd = _chk.nodata if _chk.nodata is not None else 0
+            _valid_frac = np.sum(_lst_chk != _nd) / _lst_chk.size
+            if _valid_frac == 0.0:
+                self._log.warning(
+                    f'{s3_date}: LST raster is entirely nodata — skipping.')
+                continue
+            if _valid_frac < min_valid_fraction:
+                self._log.warning(
+                    f'{s3_date}: LST raster has only '
+                    f'{_valid_frac:.1%} valid pixels '
+                    f'(min_valid_fraction={min_valid_fraction:.1%}) '
+                    f'— skipping.')
+                continue
+
             s2_date_str = find_closest_date(s3_date, s2_dates)
             s2_date = datetime.strptime(s2_date_str, '%Y%m%d')
 
@@ -760,7 +1017,9 @@ class SenETDownload:
                     "movingWindowSize": moving_window_size,
                     "disaggregatingTemperature": True,
                     "baggingRegressorOpt": {
-                        "n_jobs": SenETDownload.NUM_JOBS_DISAGGREGATOR,
+                        "n_jobs": (
+                            1 if sys.gettrace() is not None
+                            else SenETDownload.NUM_JOBS_DISAGGREGATOR),
                         "n_estimators": 30,
                         "max_samples": 0.8,
                         "max_features": 0.8}}
@@ -884,6 +1143,50 @@ class SenETDownload:
                     # use non-corrected file as final output
                     os.rename(output_file, output_fin)
 
+                if mask_to_s3_coverage:
+                    # Mask sharpened LST to only pixels where S3 had valid
+                    # data by reprojecting the S3 valid mask to the output
+                    # high-res grid and applying it.
+                    # Use s3_lst_file (not lowres_file_copy or lowres_file)
+                    # because lowres_file was overwritten in the block loop.
+                    self._log.info(
+                        f'{s3_date}: Masking sharpened LST to S3 coverage.')
+                    with rasterio.open(s3_lst_file) as _s3:
+                        _s3_arr = _s3.read(1)
+                        _s3_nd = (_s3.nodata
+                                  if _s3.nodata is not None else 0)
+                        _s3_valid = (_s3_arr != _s3_nd).astype(np.uint8)
+                        _s3_tr = _s3.transform
+                        _s3_crs = _s3.crs
+                    with rasterio.open(output_fin) as _fin:
+                        _fin_profile = _fin.profile.copy()
+                        _fin_data = _fin.read(1)
+                        _fin_nodata = _fin.nodata
+                        _fin_tr = _fin.transform
+                        _fin_crs = _fin.crs
+                        _fin_h = _fin.height
+                        _fin_w = _fin.width
+                    _s3_valid_hr = np.zeros(
+                        (_fin_h, _fin_w), dtype=np.uint8)
+                    rasterio.warp.reproject(
+                        source=_s3_valid,
+                        destination=_s3_valid_hr,
+                        src_transform=_s3_tr,
+                        src_crs=_s3_crs,
+                        dst_transform=_fin_tr,
+                        dst_crs=_fin_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    _fin_data[_s3_valid_hr == 0] = _fin_nodata
+                    with rasterio.open(
+                            output_fin, 'w', **_fin_profile) as _dst:
+                        _dst.scales = [scaling_data['scale']]
+                        _dst.descriptions = ['LST_SHARPENED_FIN']
+                        _dst.units = ['K']
+                        _dst.write(_fin_data, 1)
+                        _dst.build_overviews(
+                            (4, 8, 16), Resampling.average)
+
                 output_files[s3_date] = output_fin
 
             disaggregator = None
@@ -915,12 +1218,12 @@ class SenETDownload:
             _description_
         """
 
-        lst_dict_pkl = output_dir / self.tile / 'lst_correction.pkl'
+        lst_dict_pkl = output_dir / self.tile / f'lst_correction{self._temporal_pkl_suffix}.pkl'
 
         if corr_parameters is None:
             # No correction required
             self._lst_results = self._sharpening_results.copy()
-            sharpening_pkl = output_dir / self.tile / 'sharpening.pkl'
+            sharpening_pkl = output_dir / self.tile / f'sharpening{self._temporal_pkl_suffix}.pkl'
             shutil.copyfile(sharpening_pkl, lst_dict_pkl)
 
         else:
@@ -972,6 +1275,88 @@ class SenETDownload:
                                          self._lst_results)
 
         return self._lst_results
+
+    def compute_biopar(self,
+                       output_dir: Path,
+                       variables: List[str] = None) -> dict:
+        """Compute biophysical variables (LAI, FAPAR, FCOVER) using the
+        ESA-APEx biopar UDP on CDSE OpenEO. One OpenEO job is launched
+        per variable since the UDP only computes one variable at a time.
+
+        Args:
+            output_dir (Path): Root output directory.
+            variables (List[str], optional): List of variables to compute.
+                Defaults to BIOPAR_VARIABLES = ["LAI", "FAPAR", "FCOVER"].
+
+        Returns:
+            dict: {
+                "LAI":   {<datetime>: <Path>, ...},
+                "FAPAR": {<datetime>: <Path>, ...},
+                "FCOVER":{<datetime>: <Path>, ...}
+            }
+        """
+        if variables is None:
+            variables = type(self).BIOPAR_VARIABLES
+
+        biopar_pkl = output_dir / self.tile / f'biopar{self._temporal_pkl_suffix}.pkl'
+        biopar_dir = output_dir / self.tile / '005_biopar'
+        biopar_dir.mkdir(parents=True, exist_ok=True)
+
+        if biopar_pkl.is_file():
+            self._log.info('Biopar already computed. Loading results.')
+            self._biopar_results = self._check_and_load_pickled_dict(
+                biopar_pkl, biopar_dir)
+            return self._biopar_results
+
+        self._biopar_results = self._get_initial_output_dict()
+
+        eoconn = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        # Run one OpenEO job per variable
+        for biopar_var in variables:
+            var_dir = biopar_dir / biopar_var
+            var_dir.mkdir(parents=True, exist_ok=True)
+
+            self._log.info(f'Computing biopar variable: {biopar_var}')
+
+            # The biopar UDP handles S2 loading (B03, B04, B08 + angle bands),
+            # band selection, and SCL cloud masking internally.
+            # Pass spatial_extent, temporal_extent, and biopar_type as
+            # top-level parameters — do NOT pass a pre-built data cube.
+            biopar_cube = eoconn.datacube_from_process(
+                process_id="biopar",
+                namespace=type(self).BIOPAR_UDP_URL,
+                spatial_extent=self._spatial_extent,
+                temporal_extent=self._temporal_extent,
+                biopar_type=biopar_var
+            )
+
+            batch_job: BatchJob = self._execute_datacube(
+                biopar_cube,
+                output_format='gtiff',
+                name=f'biopar_{biopar_var}_{self.tile}',
+                job_options=type(self).JOB_OPTIONS_BIOPAR
+            )
+
+            output_files = self._download_job_result(
+                batch_job,
+                var_dir,
+                output_format='gtiff',
+                name=biopar_var
+            )
+
+            self._biopar_results[biopar_var] = \
+                type(self)._create_output_dict_gtiff(output_files)
+
+            self._log.info(
+                f'Biopar {biopar_var}: '
+                f'{len(self._biopar_results[biopar_var])} files downloaded')
+
+        type(self).pickle_write_dict(biopar_pkl,
+                                     biopar_dir, self._biopar_results)
+
+        return self._biopar_results
 
     def _get_initial_output_dict(self) -> dict:
         """
@@ -1198,13 +1583,13 @@ class SenETDownload:
                 spatial_extent=self._spatial_extent,
                 properties=cube_properties)
 
-            # Compute the SCL dilation mask
+            # Compute the SCL dilation mask the same settings as the BIOPAR UDP to be consistent with the biopar variable computation are applied to the S2 bands. 
             scl_dilated_mask = scl_cube.process(
                 "to_scl_dilation_mask",
                 data=scl_cube,
                 scl_band_name="SCL",
-                kernel1_size=9,
-                kernel2_size=39,
+                kernel1_size=17,
+                kernel2_size=201,
                 mask1_values=[2, 4, 5, 6, 7],
                 mask2_values=[3, 8, 9, 10, 11],
                 erosion_kernel_size=3,
@@ -1235,13 +1620,22 @@ class SenETDownload:
             eoconn = openeo.connect(
                 type(self).OPENEO_CDSE_URL).authenticate_oidc()
 
-        s3_band = eoconn.load_collection(
+        s3_band1 = eoconn.load_collection(
             self.name_s3,
             temporal_extent=self._temporal_extent,
             spatial_extent=self._spatial_extent,
-            bands=type(self).S3_BAND_NAMES
+            bands=type(self).S3_BAND_NAMES1
+        )
+        
+        s3_band2 = eoconn.load_collection(
+            self.name_s3,
+            temporal_extent=self._temporal_extent,
+            spatial_extent=self._spatial_extent,
+            bands=type(self).S3_BAND_NAMES2
         )
 
+        s3_band =s3_band1.merge_cubes(s3_band2)
+        
         # Further filter the S3 datacube:
         if self._s3_should_filter:
             # 1. Filter only daytime observations
@@ -1280,6 +1674,59 @@ class SenETDownload:
         )
         dem_band = dem_band.max_time()
         return dem_band
+
+    def _get_datacube_worldcover(self,
+                                 eoconn: Optional[Connection] = None
+                                 ) -> DataCube:
+        """Load the ESA WorldCover land-cover product from OpenEO.
+
+        The collection is chosen automatically based on the temporal extent:
+        - start year < 2021  → ``ESA_WORLDCOVER_10M_2020_V1``
+        - start year ≥ 2021  → ``ESA_WORLDCOVER_10M_2021_V2``
+        """
+        if eoconn is None:
+            eoconn = openeo.connect(
+                type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        wc_band = eoconn.load_collection(
+            self.name_worldcover,
+            temporal_extent=["2000-01-01", "2030-12-31"],
+            spatial_extent=self._spatial_extent,
+            bands=["MAP"],
+        )
+        wc_band = wc_band.max_time()
+        return wc_band
+
+    def _get_datacube_biopar(self, biopar_var: str,
+                             eoconn: Optional[Connection] = None) -> DataCube:
+        if eoconn is None:
+            eoconn = openeo.connect(
+                type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        # The biopar UDP handles S2 loading (B03, B04, B08 + angle bands),
+        # band selection, and SCL cloud masking internally.
+        # Pass spatial_extent, temporal_extent, and biopar_type as
+        # top-level parameters — do NOT pass a pre-built data cube.
+        biopar_cube = eoconn.datacube_from_process(
+            process_id="biopar",
+            namespace=type(self).BIOPAR_UDP_URL,
+            spatial_extent=self._spatial_extent,
+            temporal_extent=self._temporal_extent,
+            biopar_type=biopar_var
+        )
+
+        # Dekadal compositing (same as S2/NDVI)
+        if self._s2_should_composite:
+            biopar_cube = biopar_cube.aggregate_temporal_period(
+                period='dekad', reducer='median')
+
+        # Linear temporal interpolation to fill gaps (same as S2/NDVI)
+        if self._s2_should_interpolate:
+            biopar_cube = biopar_cube.apply_dimension(
+                dimension="t", process="array_interpolate_linear"
+            )
+
+        return biopar_cube
 
     def _calculate_incidence_angle(self, input_dict: dict) -> dict:
         tmp_dict = input_dict.copy()
@@ -1426,7 +1873,10 @@ class SenETDownload:
     def _create_output_dict_gtiff(
             filelist: List[Path]) -> Dict[datetime, Path]:
 
-        pattern = r".*_(\d{4})-(\d{2})-(\d{2})Z\.tif"
+        # Matches both:
+        # - openEO date format: SENTINEL2_L2A_2022-01-01Z.tif (dashes, no time)
+        # - legacy format: something_20220101T000000Z.tif (no dashes, with time)
+        pattern = r".*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z\.tif"
         output_dict = dict()
         for f in filelist:
             match = re.match(pattern, f.name)
@@ -1476,7 +1926,7 @@ class SenETDownload:
                 offsets = f_in_handler.offsets
 
                 for i in range(0, bands):
-                    desc = f_in_handler.tags(i + 1).get('DESCRIPTION')
+                    desc = f_in_handler.descriptions[i]
                     scale = scales[i]
                     offset = offsets[i]
                     data = f_in_handler.read(i + 1)
@@ -1849,7 +2299,7 @@ class SenETDownload:
         else:
             raise ValueError(f'{res} not recognised')
 
-        dst_srs = ref_crs['init']
+        dst_srs = ref_crs.to_wkt()  #adjusted to properly set the SRS in the output file was dst_srs = ref_crs['init']
 
         creation_opts = ('COMPRESS=DEFLATE', 'TILED=YES',
                          'BLOCKXSIZE=256', 'BLOCKYSIZE=256')
@@ -1921,12 +2371,14 @@ class SenETDownload:
                 SenETDownload.set_relative_paths_dict(relative_root, value)
 
             elif isinstance(value, Path):
-                input_dictionary[key] = value.relative_to(relative_root)
+                input_dictionary[key] = Path(
+                    os.path.relpath(value, relative_root))
 
             elif isinstance(value, list):
                 if all(isinstance(item, Path) for item in value):
                     for i in range(0, len(value)):
-                        value[i] = value[i].relative_to(relative_root)
+                        value[i] = Path(
+                            os.path.relpath(value[i], relative_root))
 
             else:
                 pass
@@ -1939,12 +2391,12 @@ class SenETDownload:
                 SenETDownload.set_absolute_paths_dict(relative_root, value)
 
             elif isinstance(value, Path):
-                input_dictionary[key] = relative_root / value
+                input_dictionary[key] = (relative_root / value).resolve()
 
             elif isinstance(value, list):
                 if all(isinstance(item, Path) for item in value):
                     for i in range(0, len(value)):
-                        value[i] = relative_root / value[i]
+                        value[i] = (relative_root / value[i]).resolve()
 
             else:
                 pass
