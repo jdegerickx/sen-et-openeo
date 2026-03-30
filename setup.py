@@ -20,15 +20,21 @@ with open('src/sen_et_openeo/_version.py') as fp:
 setup(
     name="sen-et-openeo",
     version=version,
-    author="Jeroen Degerickx",
-    author_email="jeroen.degerickx@vito.be",
-    description=("Computing evapotranspiration from satellite data"),
+    author="Jeroen Degerickx, Astrid Vannoppen",
+    author_email="jeroen.degerickx@vito.be, astrid.vannoppen@vito.be",
+    description=(
+        "SenET OpenEO workflow for computing LST-Ta (Land Surface Temperature "
+        "minus air temperature), LSTM-like 30 m LST, and evapotranspiration "
+        "(TSEB-PT model) from Sentinel-2, Sentinel-3 and ERA5 data via OpenEO."
+    ),
     url='',
     license="Property of VITO NV",
     setup_requires=['pytest-runner'],
     tests_require=['pytest'],
     package_data={
-        '': ['resources/*'],
+        '': ['resources/*', '*.geojson'],
+        'sen_et_openeo.layers': ['*.geojson'],
+        'sen_et_openeo.utils': ['*.geojson'],
     },
     zip_safe=True,
     python_requires='>=3.11',
