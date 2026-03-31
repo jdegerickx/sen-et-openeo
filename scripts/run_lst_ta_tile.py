@@ -321,7 +321,8 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
          mask_to_s3_coverage=False,
          external_lst_folder=None,
          biopar_chunk_months=1,
-         s2_chunk_months=1):
+         s2_chunk_months=1,
+         max_concurrent_jobs=4):
 
     logger.info('** Downloading data from OpenEO')
     data_download = SenETDownload(tile, temporal_extent)
@@ -329,7 +330,8 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
                            parallel=parallel_jobs,
                            download_biopar=compute_et_tseb,
                            biopar_chunk_months=biopar_chunk_months,
-                           s2_chunk_months=s2_chunk_months)  # output_format='gtiff',
+                           s2_chunk_months=s2_chunk_months,
+                           max_concurrent_jobs=max_concurrent_jobs)
 
     logger.info('** Preprocessing data')
     preprocess_dict = data_download.preprocess(
@@ -583,8 +585,8 @@ if __name__ == "__main__":
     # NOTE that in order to avoid processing issues, the temporal extent
     # should be limited to a maximum of 6 months.
 
-    tiles = ['31UFS']
-    temporal_extent = ['2024-10-01', '2024-12-31']#01-01 04-30, 05-01 09-30,10-01 12-31
+    tiles = ['35VMF']
+    temporal_extent = ['2024-01-01', '2024-04-30']#01-01 04-30, 05-01 09-30,10-01 12-31
     output_dir = Path('/vitodata/CHILL_Y/OPENEO/31UFS/')
     era5_tiled_folder = Path('/vitodata/CHILL_Y/data/ERA5')
     time_zone = 0
@@ -636,6 +638,11 @@ if __name__ == "__main__":
     # or 0 to use a single job covering the full temporal extent.
     s2_chunk_months = 1
 
+    # Maximum number of concurrent OpenEO jobs submitted via the
+    # MultiBackendJobManager (used for chunked S2 and BIOPAR downloads).
+    # Set to match your account's concurrent job limit.
+    max_concurrent_jobs = 4
+
     for tile in tiles:
         main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
              residual_correction, corr_parameters,
@@ -646,4 +653,5 @@ if __name__ == "__main__":
              mask_to_s3_coverage=mask_to_s3_coverage,
              external_lst_folder=external_lst_folder,
              biopar_chunk_months=biopar_chunk_months,
-             s2_chunk_months=s2_chunk_months)
+             s2_chunk_months=s2_chunk_months,
+             max_concurrent_jobs=max_concurrent_jobs)

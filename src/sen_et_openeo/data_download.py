@@ -241,7 +241,8 @@ class SenETDownload:
                  parallel: bool = True,
                  download_biopar: bool = True,
                  biopar_chunk_months: int = 0,
-                 s2_chunk_months: int = 0) -> Dict[str, any]:
+                 s2_chunk_months: int = 0,
+                 max_concurrent_jobs: int = 2) -> Dict[str, any]:
         """
         Download datacubes from specified sources.
         This method checks if data was already downloaded
@@ -546,7 +547,7 @@ class SenETDownload:
                     f'** Running chunked S2 download '
                     f'({s2_chunk_months}-month chunks)')
                 s2_chunked = self._download_s2_chunked(
-                    output_dir, s2_chunk_months)
+                    output_dir, s2_chunk_months, max_concurrent_jobs)
                 self._download_results.update(s2_chunked)
                 # Apply scale/offset to the newly downloaded S2 files
                 type(self)._add_s2_scale_offset(
@@ -568,7 +569,7 @@ class SenETDownload:
                     f'** Running chunked BIOPAR download '
                     f'({biopar_chunk_months}-month chunks)')
                 biopar_chunked = self._download_biopar_chunked(
-                    output_dir, biopar_chunk_months)
+                    output_dir, biopar_chunk_months, max_concurrent_jobs)
                 self._download_results.update(biopar_chunked)
 
         # Write the output dictionary to a pickle file
@@ -1365,7 +1366,8 @@ class SenETDownload:
     def _download_s2_chunked(
             self,
             output_dir: Path,
-            chunk_months: int = 1) -> dict:
+            chunk_months: int = 1,
+            max_concurrent_jobs: int = 2) -> dict:
         """Download Sentinel-2 data as monthly temporal chunks via
         ``openeo.extra.job_management.MultiBackendJobManager``.
 
@@ -1488,7 +1490,8 @@ class SenETDownload:
         manager = MultiBackendJobManager(
             root_dir=str(manager_root),
         )
-        manager.add_backend('cdse', connection=eoconn)
+        manager.add_backend('cdse', connection=eoconn,
+                            parallel_jobs=max_concurrent_jobs)
         manager.run_jobs(
             df=jobs_df,
             start_job=start_job,
@@ -1533,7 +1536,8 @@ class SenETDownload:
     def _download_biopar_chunked(
             self,
             output_dir: Path,
-            chunk_months: int = 1) -> dict:
+            chunk_months: int = 1,
+            max_concurrent_jobs: int = 2) -> dict:
         """Download BIOPAR variables as monthly temporal chunks via
         ``openeo.extra.job_management.MultiBackendJobManager``.
 
@@ -1631,7 +1635,8 @@ class SenETDownload:
         manager = MultiBackendJobManager(
             root_dir=str(manager_root),
         )
-        manager.add_backend('cdse', connection=eoconn)
+        manager.add_backend('cdse', connection=eoconn,
+                            parallel_jobs=max_concurrent_jobs)
         manager.run_jobs(
             df=jobs_df,
             start_job=start_job,
