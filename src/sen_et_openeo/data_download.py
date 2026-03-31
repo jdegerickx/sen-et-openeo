@@ -386,15 +386,21 @@ class SenETDownload:
         # even when they are not (yet) recorded in the pickle file.
         for name, datacube_func, output_path, fmt, job_id, job_opts in datacubes:
             if name in self._download_results:
-                # Already tracked; ensure output_files list is populated.
+                # Already tracked; ensure output_files list is populated and
+                # that the recorded files still exist on disk (they may have
+                # been deleted after the pkl was written).
                 entry = self._download_results[name]
-                if 'output_files' not in entry or not entry['output_files']:
+                existing = [f for f in entry.get('output_files', [])
+                            if Path(f).is_file()]
+                if not existing:
                     op = entry.get('output_path', output_path)
                     if fmt == 'gtiff' and op and Path(op).is_dir():
                         entry['output_files'] = _filter_tifs_by_extent(
                             sorted(Path(op).glob('*.tif')))
                     elif fmt == 'netcdf' and op and Path(op).is_file():
                         entry['output_files'] = [Path(op)]
+                    else:
+                        entry['output_files'] = []
             else:
                 # Not in pickle; check whether files are already on disk.
                 if fmt == 'gtiff' and output_path.is_dir():
@@ -419,23 +425,49 @@ class SenETDownload:
 
         # For chunked datasets S2 and BIOPAR are excluded from `datacubes`
         # above, so we need to check for their files on disk separately.
-        if s2_chunk_months > 0 and self.name_s2 not in self._download_results:
-            if output_path_s2.is_dir():
-                existing_s2 = _filter_tifs_by_extent(
-                    sorted(output_path_s2.glob('*.tif')))
-                if existing_s2:
-                    self._log.info(
-                        f'S2: found {len(existing_s2)} existing file(s). '
-                        f'Skipping chunked download.')
-                    self._download_results[self.name_s2] = {
-                        'output_path': output_path_s2,
-                        'fmt': 'gtiff',
-                        'output_files': existing_s2,
-                    }
+        if s2_chunk_months > 0:
+            # Verify that any pkl-recorded S2 files still exist on disk;
+            # if they have been removed, clear the stale entry so that
+            # the chunked download is re-triggered below.
+            if self.name_s2 in self._download_results:
+                recorded_s2 = self._download_results[self.name_s2].get(
+                    'output_files', [])
+                if not recorded_s2 or not any(
+                        Path(f).is_file() for f in recorded_s2):
+                    self._log.warning(
+                        f'S2: recorded output files no longer exist on disk. '
+                        f'Clearing cached entry to re-trigger download.')
+                    del self._download_results[self.name_s2]
+            if self.name_s2 not in self._download_results:
+                if output_path_s2.is_dir():
+                    existing_s2 = _filter_tifs_by_extent(
+                        sorted(output_path_s2.glob('*.tif')))
+                    if existing_s2:
+                        self._log.info(
+                            f'S2: found {len(existing_s2)} existing file(s). '
+                            f'Skipping chunked download.')
+                        self._download_results[self.name_s2] = {
+                            'output_path': output_path_s2,
+                            'fmt': 'gtiff',
+                            'output_files': existing_s2,
+                        }
 
         if download_biopar and biopar_chunk_months > 0:
             for _bv in type(self).BIOPAR_VARIABLES:
                 _bname = f'BIOPAR_{_bv}'
+                # Verify that any pkl-recorded files still exist on disk;
+                # if they have been removed, clear the stale entry so that
+                # the chunked download is re-triggered below.
+                if _bname in self._download_results:
+                    recorded = self._download_results[_bname].get(
+                        'output_files', [])
+                    if not recorded or not any(
+                            Path(f).is_file() for f in recorded):
+                        self._log.warning(
+                            f'{_bname}: recorded output files no longer '
+                            f'exist on disk. Clearing cached entry to '
+                            f're-trigger download.')
+                        del self._download_results[_bname]
                 if _bname not in self._download_results:
                     _bdir = output_dir / 'BIOPAR' / _bv
                     if _bdir.is_dir():
@@ -1510,9 +1542,11 @@ class SenETDownload:
 
         for _, row in job_db_df[
                 job_db_df['status'] == 'finished'].iterrows():
-            job_dir = manager_root / row['id']
+            job_dir = manager_root / f"job_{row['id']}"
             for f in sorted(job_dir.rglob('*.tif')):
-                dest = s2_dir / f.name
+                # Rename openEO_<date>Z.tif → SENTINEL2_L2A_<date>Z.tif
+                dest_name = re.sub(r'^openEO', self.name_s2, f.name)
+                dest = s2_dir / dest_name
                 if not dest.exists():
                     shutil.move(str(f), str(dest))
 
@@ -1655,10 +1689,13 @@ class SenETDownload:
 
         for _, row in job_db_df[
                 job_db_df['status'] == 'finished'].iterrows():
-            job_dir = manager_root / row['id']
+            job_dir = manager_root / f"job_{row['id']}"
             var_dir = output_dir / 'BIOPAR' / row['biopar_var']
+            bname = f"BIOPAR_{row['biopar_var']}"
             for f in sorted(job_dir.rglob('*.tif')):
-                dest = var_dir / f.name
+                # Rename openEO_<date>Z.tif → BIOPAR_<VAR>_<date>Z.tif
+                dest_name = re.sub(r'^openEO', bname, f.name)
+                dest = var_dir / dest_name
                 if not dest.exists():
                     shutil.move(str(f), str(dest))
 

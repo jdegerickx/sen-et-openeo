@@ -585,8 +585,8 @@ if __name__ == "__main__":
     # NOTE that in order to avoid processing issues, the temporal extent
     # should be limited to a maximum of 6 months.
 
-    tiles = ['35VMF']
-    temporal_extent = ['2024-01-01', '2024-04-30']#01-01 04-30, 05-01 09-30,10-01 12-31
+    tiles = ['31UFS']
+    temporal_extent = ['2024-10-01', '2024-12-31']#01-01 04-30, 05-01 09-30,10-01 12-31
     output_dir = Path('/vitodata/CHILL_Y/OPENEO/31UFS/')
     era5_tiled_folder = Path('/vitodata/CHILL_Y/data/ERA5')
     time_zone = 0
