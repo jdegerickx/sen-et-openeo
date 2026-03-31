@@ -295,19 +295,41 @@ def resample_to_match(src_file: Path, ref_file: Path, dst_file: Path,
     return dst_file
 
 
+def _find_external_lst(folder: Path, tile: str, timestamp) -> Path:
+    """Locate an external LST GeoTIFF using the known folder structure:
+
+        <folder>/<tile>/<year>/S3-LSTHR/<YYYYMMDDTHHMMSS>/
+            <tile>_S3-LSTHR_<YYYYMMDDTHHMMSS>_COG.tif
+
+    Returns the Path if it exists, otherwise None.
+    """
+    timestr = timestamp.strftime('%Y%m%dT%H%M%S')
+    year = timestamp.strftime('%Y')
+    expected = (
+        Path(folder) / tile / year / 'S3-LSTHR' / timestr
+        / f'{tile}_S3-LSTHR_{timestr}_COG.tif'
+    )
+    return expected if expected.exists() else None
+
+
 def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
          residual_correction=False, corr_parameters=None,
          parallel_jobs=False, delete_tmp_data=False,
          generate_lstm_like=False, et_histogram=False,
          compute_et_tseb=True,
          min_valid_s3_fraction=0.0,
-         mask_to_s3_coverage=False):
+         mask_to_s3_coverage=False,
+         external_lst_folder=None,
+         biopar_chunk_months=1,
+         s2_chunk_months=1):
 
     logger.info('** Downloading data from OpenEO')
     data_download = SenETDownload(tile, temporal_extent)
     data_download.download(output_dir,
                            parallel=parallel_jobs,
-                           download_biopar=compute_et_tseb)  # output_format='gtiff',
+                           download_biopar=compute_et_tseb,
+                           biopar_chunk_months=biopar_chunk_months,
+                           s2_chunk_months=s2_chunk_months)  # output_format='gtiff',
 
     logger.info('** Preprocessing data')
     preprocess_dict = data_download.preprocess(
@@ -456,6 +478,19 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
             lstm_et_file = outdir_et_lstm / f'TSEB-PT_{timestr}_{tile}.vrt'
             if lstm_ta_file.exists() and lstm_et_file.exists():
                 continue
+            # If an external LST folder is provided, use only those files.
+            # Timestamps with no matching external file are skipped entirely.
+            if external_lst_folder is not None:
+                _ext = _find_external_lst(external_lst_folder, tile, t)
+                if _ext is not None:
+                    logger.info(
+                        f'  Using external LST for {timestr}: {_ext.name}')
+                    lstm_out = _ext
+                else:
+                    logger.warning(
+                        f'  No external LST found for {timestr} in '
+                        f'{external_lst_folder} — skipping.')
+                    continue
             if not lstm_out.exists():
                 logger.info(f'  Generating LSTM-like LST: {timestr}')
                 generate_lstm_like_lst(
@@ -549,7 +584,7 @@ if __name__ == "__main__":
     # should be limited to a maximum of 6 months.
 
     tiles = ['31UFS']
-    temporal_extent = ['2024-05-01', '2024-09-30']
+    temporal_extent = ['2024-10-01', '2024-12-31']#01-01 04-30, 05-01 09-30,10-01 12-31
     output_dir = Path('/vitodata/CHILL_Y/OPENEO/31UFS/')
     era5_tiled_folder = Path('/vitodata/CHILL_Y/data/ERA5')
     time_zone = 0
@@ -581,6 +616,26 @@ if __name__ == "__main__":
     # S3 observation was valid (no extrapolation outside S3 coverage).
     mask_to_s3_coverage = False
 
+    # -------------------------------------------------------------------------
+    # INTERNAL USE ONLY: folder containing pre-existing LST GeoTIFFs to use
+    # instead of the sharpened S3 LST for the LSTM-like LST-Ta and ET products.
+    # Files are matched to S3 timestamps by date (YYYYMMDD in the filename).
+    # Set to None to use the standard sharpened LST (default behaviour).
+    # -------------------------------------------------------------------------
+    external_lst_folder = None
+    # external_lst_folder = Path('/vitodata/CHILL_Y/LSTMLikeDataset/')
+
+    # Number of months per BIOPAR OpenEO job. Splitting into smaller chunks
+    # reduces per-job memory so the default executor settings can be used.
+    # Set to 1 for monthly jobs (recommended), or 0 to use a single job
+    # covering the full temporal extent (original behaviour).
+    biopar_chunk_months = 1
+
+    # Number of months per Sentinel-2 OpenEO job. Same rationale as
+    # biopar_chunk_months above. Set to 1 for monthly jobs (recommended),
+    # or 0 to use a single job covering the full temporal extent.
+    s2_chunk_months = 1
+
     for tile in tiles:
         main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
              residual_correction, corr_parameters,
@@ -588,4 +643,7 @@ if __name__ == "__main__":
              et_histogram=et_histogram,
              compute_et_tseb=compute_et_tseb,
              min_valid_s3_fraction=min_valid_s3_fraction,
-             mask_to_s3_coverage=mask_to_s3_coverage)
+             mask_to_s3_coverage=mask_to_s3_coverage,
+             external_lst_folder=external_lst_folder,
+             biopar_chunk_months=biopar_chunk_months,
+             s2_chunk_months=s2_chunk_months)

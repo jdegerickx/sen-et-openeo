@@ -6,7 +6,7 @@ try:
     from typing import Literal
 except ImportError:
     from typing_extensions import Literal
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import time
 import re
@@ -132,10 +132,8 @@ class SenETDownload:
                      "vito/biopar/openeo_udp/biopar.json")
     JOB_OPTIONS_BIOPAR = {
         "executor-memory": "7G",
-        "executor-memoryOverhead": "5G",
+        "executor-memoryOverhead": "4G",
         "executor-cores": "1",
-        "driver-memory": "4G",
-        "driver-memoryOverhead": "6G",
     }
 
     # TODO: should be configurable in the instance itself.
@@ -241,7 +239,9 @@ class SenETDownload:
     def download(self,
                  output_dir: Path,
                  parallel: bool = True,
-                 download_biopar: bool = True) -> Dict[str, any]:
+                 download_biopar: bool = True,
+                 biopar_chunk_months: int = 0,
+                 s2_chunk_months: int = 0) -> Dict[str, any]:
         """
         Download datacubes from specified sources.
         This method checks if data was already downloaded
@@ -257,6 +257,16 @@ class SenETDownload:
             biophysical variables (LAI, FAPAR, FCOVER). Set to False
             to skip BIOPAR downloads when ET computation is disabled.
             Defaults to True.
+            biopar_chunk_months (int, optional): When > 0, BIOPAR jobs are
+            split into chunks of this many months and submitted via
+            MultiBackendJobManager. Set to 0 to use a single job per
+            variable (original behaviour). Defaults to 0.
+            s2_chunk_months (int, optional): When > 0, Sentinel-2 jobs are
+            split into chunks of this many months and submitted via
+            MultiBackendJobManager instead of a single large job. This
+            reduces per-job memory and allows the default executor memory
+            settings to be used. Set to 0 (default) to use a single job
+            covering the full temporal extent.
 
         Returns:
             Dict[str, any]:
@@ -309,14 +319,14 @@ class SenETDownload:
 
         # Define datacubes to download
         # Format (NAME, DATACUBE_FUNC, OUTPUT_FILE, JOBID, JOB_OPTIONS)
-        datacubes = [
+        datacubes = ([
             (self.name_s2,
              self._get_datacube_s2,
              output_path_s2,
              'gtiff',
              self.s2_jobid,
              type(self).JOB_OPTIONS_S2),
-
+        ] if s2_chunk_months <= 0 else []) + [
             (self.name_s3,
              self._get_datacube_s3,
              output_path_s3,
@@ -345,7 +355,7 @@ class SenETDownload:
              None,
              type(self).JOB_OPTIONS_BIOPAR)
             for var in type(self).BIOPAR_VARIABLES
-        ] if download_biopar else [])
+        ] if (download_biopar and biopar_chunk_months <= 0) else [])
         # If (part of) the data is already downloaded,
         # load the dictionary from the pickle file (if present),
         # then also scan output directories for any files already on disk.
@@ -368,22 +378,8 @@ class SenETDownload:
             str(self._temporal_extent[1])[:10], '%Y-%m-%d')
 
         def _filter_tifs_by_extent(tif_list):
-            """Keep only tif files whose date (from filename) is within
-            [t_start, t_end]. Files without a parseable date are kept."""
-            _pat = re.compile(
-                r'.*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z?\.tif',
-                re.I)
-            filtered = []
-            for f in tif_list:
-                m = _pat.match(f.name)
-                if m:
-                    fdate = datetime(
-                        int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                    if t_start <= fdate <= t_end:
-                        filtered.append(f)
-                else:
-                    filtered.append(f)  # no date in name → keep
-            return filtered
+            return type(self).filter_tifs_by_extent(
+                tif_list, t_start, t_end)
 
         # Additionally check the output directories for existing files,
         # even when they are not (yet) recorded in the pickle file.
@@ -420,11 +416,59 @@ class SenETDownload:
                         'fmt': fmt,
                         'output_files': [output_path]}
 
+        # For chunked datasets S2 and BIOPAR are excluded from `datacubes`
+        # above, so we need to check for their files on disk separately.
+        if s2_chunk_months > 0 and self.name_s2 not in self._download_results:
+            if output_path_s2.is_dir():
+                existing_s2 = _filter_tifs_by_extent(
+                    sorted(output_path_s2.glob('*.tif')))
+                if existing_s2:
+                    self._log.info(
+                        f'S2: found {len(existing_s2)} existing file(s). '
+                        f'Skipping chunked download.')
+                    self._download_results[self.name_s2] = {
+                        'output_path': output_path_s2,
+                        'fmt': 'gtiff',
+                        'output_files': existing_s2,
+                    }
+
+        if download_biopar and biopar_chunk_months > 0:
+            for _bv in type(self).BIOPAR_VARIABLES:
+                _bname = f'BIOPAR_{_bv}'
+                if _bname not in self._download_results:
+                    _bdir = output_dir / 'BIOPAR' / _bv
+                    if _bdir.is_dir():
+                        existing_b = _filter_tifs_by_extent(
+                            sorted(_bdir.glob('*.tif')))
+                        if existing_b:
+                            self._log.info(
+                                f'{_bname}: found {len(existing_b)} existing '
+                                f'file(s). Skipping chunked download.')
+                            self._download_results[_bname] = {
+                                'output_path': _bdir,
+                                'fmt': 'gtiff',
+                                'output_files': existing_b,
+                            }
+
         to_download = [n for n in all_names
                        if n not in self._download_results]
         datacubes = [dc for dc in datacubes if dc[0] in to_download]
 
-        if len(datacubes) == 0:
+        # Determine whether any chunked job still needs to run so we do not
+        # return early and skip the chunked download blocks below.
+        _need_chunked_s2 = (
+            s2_chunk_months > 0
+            and not self._download_results.get(
+                self.name_s2, {}).get('output_files'))
+        _need_chunked_biopar = (
+            download_biopar and biopar_chunk_months > 0
+            and not all(
+                self._download_results.get(
+                    f'BIOPAR_{_v}', {}).get('output_files')
+                for _v in type(self).BIOPAR_VARIABLES))
+
+        if len(datacubes) == 0 and not _need_chunked_s2 \
+                and not _need_chunked_biopar:
             self._log.info('All data already available. Returning results.')
             return self._download_results
 
@@ -489,6 +533,43 @@ class SenETDownload:
             output_files_s2 = self._download_results[self.name_s2][
                 'output_files']
             type(self)._add_s2_scale_offset(output_files_s2)
+
+        # If chunked S2 download is requested, run it now via the
+        # MultiBackendJobManager and merge the results into the download dict.
+        if s2_chunk_months > 0:
+            _s2_entry = self._download_results.get(self.name_s2)
+            if _s2_entry and _s2_entry.get('output_files'):
+                self._log.info(
+                    'S2 already available. Skipping chunked download.')
+            else:
+                self._log.info(
+                    f'** Running chunked S2 download '
+                    f'({s2_chunk_months}-month chunks)')
+                s2_chunked = self._download_s2_chunked(
+                    output_dir, s2_chunk_months)
+                self._download_results.update(s2_chunked)
+                # Apply scale/offset to the newly downloaded S2 files
+                type(self)._add_s2_scale_offset(
+                    self._download_results[self.name_s2]['output_files'])
+
+        # If chunked BIOPAR download is requested, run it now via the
+        # MultiBackendJobManager and merge the results into the download dict.
+        if download_biopar and biopar_chunk_months > 0:
+            _biopar_done = all(
+                f'BIOPAR_{_v}' in self._download_results
+                and self._download_results[f'BIOPAR_{_v}'].get('output_files')
+                for _v in type(self).BIOPAR_VARIABLES
+            )
+            if _biopar_done:
+                self._log.info(
+                    'BIOPAR already available. Skipping chunked download.')
+            else:
+                self._log.info(
+                    f'** Running chunked BIOPAR download '
+                    f'({biopar_chunk_months}-month chunks)')
+                biopar_chunked = self._download_biopar_chunked(
+                    output_dir, biopar_chunk_months)
+                self._download_results.update(biopar_chunked)
 
         # Write the output dictionary to a pickle file
         type(self).pickle_write_dict(output_dict_pkl,
@@ -1281,6 +1362,320 @@ class SenETDownload:
 
         return self._lst_results
 
+    def _download_s2_chunked(
+            self,
+            output_dir: Path,
+            chunk_months: int = 1) -> dict:
+        """Download Sentinel-2 data as monthly temporal chunks via
+        ``openeo.extra.job_management.MultiBackendJobManager``.
+
+        Submits one OpenEO batch job per temporal chunk, tracks them via a
+        persistent CSV job database (resumable if interrupted), then collects
+        all downloaded GeoTIFFs into the standard ``S2/`` directory used by
+        ``preprocess()``.
+
+        Args:
+            output_dir (Path): The ``001_download`` sub-directory.
+            chunk_months (int): Number of months per temporal chunk.
+
+        Returns:
+            dict: Keyed by ``self.name_s2`` with the standard
+            download-result structure
+            ``{'output_path': Path, 'fmt': 'gtiff', 'output_files': [...]``.
+        """
+        try:
+            from openeo.extra.job_management import (
+                MultiBackendJobManager,
+                CsvJobDatabase,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                'openeo.extra.job_management is required for chunked S2 '
+                'download (openeo-python-client >= 0.31.0).'
+            ) from exc
+
+        # ── build temporal chunks ──────────────────────────────────────────
+        start_dt = datetime.strptime(self._temporal_extent[0], '%Y-%m-%d')
+        end_dt   = datetime.strptime(self._temporal_extent[1], '%Y-%m-%d')
+        chunks: List[tuple] = []
+        current = start_dt
+        while current <= end_dt:
+            m         = current.month - 1 + chunk_months
+            next_dt   = datetime(current.year + m // 12, m % 12 + 1, 1)
+            chunk_end = min(next_dt - timedelta(days=1), end_dt)
+            chunks.append((
+                current.strftime('%Y-%m-%d'),
+                chunk_end.strftime('%Y-%m-%d'),
+            ))
+            current = next_dt
+        self._log.info(
+            f'S2 chunked download: {len(chunks)} chunks')
+
+        s2_dir = output_dir / 'S2'
+        s2_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── build jobs DataFrame ───────────────────────────────────────────
+        jobs_df = pd.DataFrame(
+            [{'start_date': cs, 'end_date': ce} for cs, ce in chunks])
+
+        # ── job manager setup ──────────────────────────────────────────────
+        manager_root = output_dir / 'S2' / '_job_manager'
+        manager_root.mkdir(parents=True, exist_ok=True)
+        job_db_path = (
+            output_dir.parent
+            / f's2_jobs{self._temporal_pkl_suffix}.csv'
+        )
+
+        eoconn         = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+        spatial_extent = self._spatial_extent
+        s2_should_mask        = self._s2_should_mask
+        s2_should_composite   = self._s2_should_composite
+        s2_should_interpolate = self._s2_should_interpolate
+        name_s2         = self.name_s2
+        tile            = self.tile
+        job_options     = type(self).JOB_OPTIONS_S2
+        band_names      = type(self).S2_BAND_NAMES
+
+        def start_job(row, connection, **kwargs):
+            chunk_extent = [row['start_date'], row['end_date']]
+            cloud_props = {'eo:cloud_cover': lambda val: val <= 95.0}
+            cube = connection.load_collection(
+                name_s2,
+                temporal_extent=chunk_extent,
+                spatial_extent=spatial_extent,
+                bands=band_names,
+                properties=cloud_props,
+            ).resample_spatial(resolution=20)
+
+            if s2_should_mask:
+                scl_cube = connection.load_collection(
+                    collection_id=name_s2,
+                    bands=['SCL'],
+                    temporal_extent=chunk_extent,
+                    spatial_extent=spatial_extent,
+                    properties=cloud_props,
+                )
+                scl_dilated_mask = scl_cube.process(
+                    'to_scl_dilation_mask',
+                    data=scl_cube,
+                    scl_band_name='SCL',
+                    kernel1_size=17,
+                    kernel2_size=201,
+                    mask1_values=[2, 4, 5, 6, 7],
+                    mask2_values=[3, 8, 9, 10, 11],
+                    erosion_kernel_size=3,
+                ).rename_labels('bands', ['S2-L2A-SCL_DILATED_MASK'])
+                cube = cube.mask(scl_dilated_mask)
+
+            cube = cube.ndvi(nir='B08', red='B04', target_band='NDVI')
+
+            if s2_should_composite:
+                cube = cube.aggregate_temporal_period(
+                    period='dekad', reducer='median')
+
+            if s2_should_interpolate:
+                cube = cube.apply_dimension(
+                    dimension='t',
+                    process='array_interpolate_linear')
+
+            return cube.create_job(
+                out_format='gtiff',
+                title=f'S2_{tile}_{row["start_date"]}_{row["end_date"]}',
+                job_options=job_options,
+            )
+
+        manager = MultiBackendJobManager(
+            root_dir=str(manager_root),
+        )
+        manager.add_backend('cdse', connection=eoconn)
+        manager.run_jobs(
+            df=jobs_df,
+            start_job=start_job,
+            job_db=CsvJobDatabase(job_db_path),
+        )
+
+        # ── move downloaded files to S2 dir & report failures ───────────────
+        job_db_df = pd.read_csv(job_db_path)
+        failed = job_db_df[
+            job_db_df['status'].isin(['error', 'cancelled'])]
+        if not failed.empty:
+            self._log.warning(
+                f'S2 chunked: {len(failed)} job(s) failed/cancelled:\n'
+                + failed[['start_date', 'end_date',
+                           'status']].to_string(index=False))
+
+        for _, row in job_db_df[
+                job_db_df['status'] == 'finished'].iterrows():
+            job_dir = manager_root / row['id']
+            for f in sorted(job_dir.rglob('*.tif')):
+                dest = s2_dir / f.name
+                if not dest.exists():
+                    shutil.move(str(f), str(dest))
+
+        # ── build standard download-result structure ───────────────────────
+        t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        t_end = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+        output_files = type(self).filter_tifs_by_extent(
+            sorted(s2_dir.glob('*.tif')), t_start, t_end)
+        self._log.info(
+            f'S2 chunked: {len(output_files)} file(s) collected in {s2_dir}')
+        return {
+            self.name_s2: {
+                'output_path':  s2_dir,
+                'fmt':          'gtiff',
+                'output_files': output_files,
+            }
+        }
+
+    def _download_biopar_chunked(
+            self,
+            output_dir: Path,
+            chunk_months: int = 1) -> dict:
+        """Download BIOPAR variables as monthly temporal chunks via
+        ``openeo.extra.job_management.MultiBackendJobManager``.
+
+        Submits one OpenEO batch job per (variable, chunk) combination,
+        tracks them via a persistent CSV job database (resumable if
+        interrupted), then moves the downloaded GeoTIFFs into the standard
+        per-variable subdirectory layout used by ``preprocess()``.
+
+        Args:
+            output_dir (Path): The ``001_download`` sub-directory.
+            chunk_months (int): Number of months per temporal chunk.
+
+        Returns:
+            dict: Keyed by ``'BIOPAR_{var}'`` with the standard
+            download-result structure
+            ``{'output_path': Path, 'fmt': 'gtiff', 'output_files': [...]``.
+        """
+        try:
+            from openeo.extra.job_management import (
+                MultiBackendJobManager,
+                CsvJobDatabase,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                'openeo.extra.job_management is required for chunked BIOPAR '
+                'download (openeo-python-client >= 0.31.0).'
+            ) from exc
+
+        variables = type(self).BIOPAR_VARIABLES
+
+        # ── build temporal chunks ──────────────────────────────────────────
+        start_dt = datetime.strptime(self._temporal_extent[0], '%Y-%m-%d')
+        end_dt   = datetime.strptime(self._temporal_extent[1], '%Y-%m-%d')
+        chunks: List[tuple] = []
+        current = start_dt
+        while current <= end_dt:
+            m         = current.month - 1 + chunk_months
+            next_dt   = datetime(current.year + m // 12, m % 12 + 1, 1)
+            chunk_end = min(next_dt - timedelta(days=1), end_dt)
+            chunks.append((
+                current.strftime('%Y-%m-%d'),
+                chunk_end.strftime('%Y-%m-%d'),
+            ))
+            current = next_dt
+        self._log.info(
+            f'BIOPAR chunked download: {len(variables)} vars \u00d7 '
+            f'{len(chunks)} chunks = {len(variables) * len(chunks)} jobs')
+
+        # ── create per-variable output directories ─────────────────────────
+        for var in variables:
+            (output_dir / 'BIOPAR' / var).mkdir(parents=True, exist_ok=True)
+
+        # ── build jobs DataFrame ───────────────────────────────────────────
+        rows = [
+            {'biopar_var': var, 'start_date': cs, 'end_date': ce}
+            for var in variables
+            for cs, ce in chunks
+        ]
+        jobs_df = pd.DataFrame(rows)
+
+        # ── job manager setup ──────────────────────────────────────────────
+        # Job results are downloaded to manager_root/<job_id>/
+        manager_root = output_dir / 'BIOPAR' / '_job_manager'
+        manager_root.mkdir(parents=True, exist_ok=True)
+        # Job DB CSV lives next to the other pkl files in the tile directory
+        job_db_path = (
+            output_dir.parent
+            / f'biopar_jobs{self._temporal_pkl_suffix}.csv'
+        )
+
+        eoconn = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+        spatial_extent = self._spatial_extent
+        biopar_udp_url = type(self).BIOPAR_UDP_URL
+        job_options    = type(self).JOB_OPTIONS_BIOPAR
+        tile           = self.tile
+
+        def start_job(row, connection, **kwargs):
+            cube = connection.datacube_from_process(
+                process_id='biopar',
+                namespace=biopar_udp_url,
+                spatial_extent=spatial_extent,
+                temporal_extent=[row['start_date'], row['end_date']],
+                biopar_type=row['biopar_var'],
+            )
+            return cube.create_job(
+                out_format='gtiff',
+                title=(
+                    f"biopar_{row['biopar_var']}_{tile}"
+                    f"_{row['start_date']}_{row['end_date']}"
+                ),
+                job_options=job_options,
+            )
+
+        manager = MultiBackendJobManager(
+            root_dir=str(manager_root),
+        )
+        manager.add_backend('cdse', connection=eoconn)
+        manager.run_jobs(
+            df=jobs_df,
+            start_job=start_job,
+            job_db=CsvJobDatabase(job_db_path),
+        )
+
+        # ── move downloaded files to per-variable dirs ─────────────────────
+        job_db_df = pd.read_csv(job_db_path)
+        failed = job_db_df[
+            job_db_df['status'].isin(['error', 'cancelled'])]
+        if not failed.empty:
+            self._log.warning(
+                f'BIOPAR chunked: {len(failed)} job(s) failed/cancelled:\n'
+                + failed[['biopar_var', 'start_date',
+                           'end_date', 'status']].to_string(index=False))
+
+        for _, row in job_db_df[
+                job_db_df['status'] == 'finished'].iterrows():
+            job_dir = manager_root / row['id']
+            var_dir = output_dir / 'BIOPAR' / row['biopar_var']
+            for f in sorted(job_dir.rglob('*.tif')):
+                dest = var_dir / f.name
+                if not dest.exists():
+                    shutil.move(str(f), str(dest))
+
+        # ── build standard download-result structure ───────────────────────
+        b_t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        b_t_end = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+        results: dict = {}
+        for var in variables:
+            var_dir      = output_dir / 'BIOPAR' / var
+            output_files = type(self).filter_tifs_by_extent(
+                sorted(var_dir.glob('*.tif')), b_t_start, b_t_end)
+            results[f'BIOPAR_{var}'] = {
+                'output_path': var_dir,
+                'fmt':         'gtiff',
+                'output_files': output_files,
+            }
+            self._log.info(
+                f'BIOPAR {var}: {len(output_files)} file(s) collected')
+        return results
+
     def compute_biopar(self,
                        output_dir: Path,
                        variables: List[str] = None) -> dict:
@@ -1822,6 +2217,27 @@ class SenETDownload:
             quality_flag_dict[s3_date] = f_out
 
         return quality_flag_dict
+
+    @staticmethod
+    def filter_tifs_by_extent(
+            tif_list,
+            t_start: datetime,
+            t_end: datetime) -> list:
+        """Return only those paths whose filename-embedded date falls within
+        ``[t_start, t_end]``.  Files with no recognisable date are kept."""
+        _pat = re.compile(
+            r'.*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z?\.tif', re.I)
+        filtered = []
+        for f in tif_list:
+            m = _pat.match(Path(f).name)
+            if m:
+                fdate = datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if t_start <= fdate <= t_end:
+                    filtered.append(f)
+            else:
+                filtered.append(f)  # no date in name → keep
+        return filtered
 
     @staticmethod
     def _convert_spatial_extent(
