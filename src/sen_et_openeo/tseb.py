@@ -320,7 +320,9 @@ def compute_meteo_for_tseb(time, elev_file, time_zone, era5col, outdir):
     def write_tif(data, suffix):
         path = outdir / f'{suffix}.tif'
         data = np.squeeze(np.where(np.isfinite(data), data, -9999.0))
-        with rasterio.open(path, 'w', **ref_profile) as dst:
+        prof = ref_profile.copy()
+        prof.update(compress='deflate', PREDICTOR=2)
+        with rasterio.open(path, 'w', **prof) as dst:
             dst.write(data.astype(np.float32), 1)
         return path
 
@@ -924,7 +926,7 @@ def compute_et(tile, time, lst_file, vza_file, lat_file, lon_file, elev_file,
         lst_k = raw * scl
         if nd is not None:
             lst_k[raw == nd] = -9999.0
-        prof.update(dtype=rasterio.float32, nodata=-9999.0)
+        prof.update(dtype=rasterio.float32, nodata=-9999.0, compress='deflate', PREDICTOR=2)
         with rasterio.open(lst_k_file, 'w', **prof) as dst:
             dst.write(lst_k, 1)
 
@@ -993,6 +995,25 @@ def compute_et(tile, time, lst_file, vza_file, lat_file, lon_file, elev_file,
     _process_tseb_tiled(model, output_file, lst_datetime=time)
     del model
     gc.collect()
+
+    # Clean up temporary intermediate files to save storage
+    if lst_k_file.exists():
+        logger.debug(f'Removing temporary LST conversion file: {lst_k_file.name}')
+        lst_k_file.unlink()
+    
+    # Clean up meteo intermediate GeoTIFFs (only needed for TSEB input)
+    meteo_cleanup = [
+        outdir / f'{timestr}_TA.tif',
+        outdir / f'{timestr}_WS.tif',
+        outdir / f'{timestr}_EA.tif',
+        outdir / f'{timestr}_PA.tif',
+        outdir / f'{timestr}_SW-IN.tif',
+        outdir / f'{datestr}_SW-IN-DD.tif',
+    ]
+    for meteo_file in meteo_cleanup:
+        if meteo_file.exists():
+            logger.debug(f'Removing temporary meteo file: {meteo_file.name}')
+            meteo_file.unlink()
 
     if et_histogram:
         plot_et_histogram(output_file)

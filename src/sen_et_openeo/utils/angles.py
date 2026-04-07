@@ -1,4 +1,6 @@
 import numpy as np
+from loguru import logger
+from skimage.transform import resize
 
 
 from sen_et_openeo.utils.geoloader import (getrasterinfo,
@@ -82,7 +84,17 @@ def incidence_angle_tilted(latfile, lonfile, doy, ftime,
     lon = readraster(lonfile)
     aspect = readraster(aspectfile)
     slope = readraster(slopefile)
-    epsg, bounds = getrasterinfo(slopefile)[0:2]
+    epsg, bounds = getrasterinfo(latfile)[0:2]
+
+    if slope.shape != lat.shape:
+        logger.warning(
+            f'Shape mismatch — lat: {lat.shape}, slope: {slope.shape}. '
+            f'Resampling slope and aspect to match lat/lon grid.'
+        )
+        slope = resize(slope, lat.shape, order=1, preserve_range=True,
+                       anti_aliasing=False).astype(np.float32)
+        aspect = resize(aspect, lat.shape, order=1, preserve_range=True,
+                        anti_aliasing=False).astype(np.float32)
 
     # Get the dclination and hour angle
     delta = declination_angle(doy)

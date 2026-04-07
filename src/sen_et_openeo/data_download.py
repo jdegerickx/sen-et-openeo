@@ -399,6 +399,15 @@ class SenETDownload:
                             sorted(Path(op).glob('*.tif')))
                     elif fmt == 'netcdf' and op and Path(op).is_file():
                         entry['output_files'] = [Path(op)]
+                    elif fmt == 'netcdf':
+                        # Recorded file no longer exists; try to find
+                        # covering NC files from prior chunked runs.
+                        nc_dir = (Path(op).parent
+                                  if op and not Path(op).is_dir()
+                                  else (Path(op) if op else output_path.parent))
+                        covering = type(self)._find_covering_s3_netcdfs(
+                            nc_dir, t_start, t_end)
+                        entry['output_files'] = covering if covering else []
                     else:
                         entry['output_files'] = []
             else:
@@ -422,6 +431,21 @@ class SenETDownload:
                         'output_path': output_path,
                         'fmt': fmt,
                         'output_files': [output_path]}
+                elif fmt == 'netcdf' and output_path.parent.is_dir():
+                    # Exact file missing – check if multiple NC files from
+                    # prior chunked runs collectively cover the requested
+                    # temporal extent (e.g. 3-month blocks vs full year).
+                    covering = type(self)._find_covering_s3_netcdfs(
+                        output_path.parent, t_start, t_end)
+                    if covering:
+                        self._log.info(
+                            f'{name}: found {len(covering)} existing NC '
+                            f'file(s) that collectively cover the requested '
+                            f'temporal extent. Skipping download.')
+                        self._download_results[name] = {
+                            'output_path': output_path.parent,
+                            'fmt': fmt,
+                            'output_files': covering}
 
         # For chunked datasets S2 and BIOPAR are excluded from `datacubes`
         # above, so we need to check for their files on disk separately.
@@ -461,11 +485,11 @@ class SenETDownload:
                 if _bname in self._download_results:
                     recorded = self._download_results[_bname].get(
                         'output_files', [])
-                    if not recorded or not any(
+                    if not recorded or not all(
                             Path(f).is_file() for f in recorded):
                         self._log.warning(
-                            f'{_bname}: recorded output files no longer '
-                            f'exist on disk. Clearing cached entry to '
+                            f'{_bname}: one or more recorded output files no '
+                            f'longer exist on disk. Clearing cached entry to '
                             f're-trigger download.')
                         del self._download_results[_bname]
                 if _bname not in self._download_results:
@@ -760,12 +784,25 @@ class SenETDownload:
         output_dir = output_dir / self.tile / '002_preprocess'
 
         # If the data is already preprocessed,
-        # load and return the dictionary from the pickle file
+        # load the dictionary from the pickle file and verify that the
+        # recorded files still exist on disk before skipping re-processing.
         if output_dict_pkl.is_file():
             self._preprocess_results = self._check_and_load_pickled_dict(
                 output_dict_pkl, output_dir)
-            self._log.info('Data already preprocessed. Loading results.')
-            return self._preprocess_results
+            missing = [
+                p for p in type(self)._iter_paths(self._preprocess_results)
+                if not p.is_file()
+            ]
+            if missing:
+                self._log.warning(
+                    f'Preprocess pkl found but {len(missing)} recorded '
+                    f'file(s) are missing from disk '
+                    f'(e.g. {missing[0].name}). Re-running preprocessing.')
+                self._preprocess_results = None
+            else:
+                self._log.info(
+                    'Data already preprocessed. Loading results.')
+                return self._preprocess_results
 
         # Check on download_results
         if self._download_results is None:
@@ -790,14 +827,20 @@ class SenETDownload:
             self)._extract_dem_features(output_file_dem,
                                         output_dir_dem)
 
-        # Single S3 netcdf file, convert to geotiff
-        output_file_s3 = self._download_results[self.name_s3][
-            'output_files'][0]
+        # One or more S3 netcdf files (multiple when prior chunked runs
+        # already exist on disk); convert each and merge the per-timestamp
+        # GeoTIFF dictionaries so that all timestamps are available.
+        output_files_s3 = self._download_results[self.name_s3]['output_files']
         output_dir_s3 = output_dir / 'S3'
-        self._preprocess_results[self.name_s3] = type(
-            self)._netcdf_to_geotiff_s3(output_file_s3,
-                                        output_dir_s3,
-                                        force_f32=True)
+        s3_gtiff_merged: Dict[str, Dict[datetime, Path]] = {}
+        for _nc in output_files_s3:
+            _partial = type(self)._netcdf_to_geotiff_s3(
+                _nc, output_dir_s3, force_f32=True)
+            for _var, _date_dict in _partial.items():
+                if _var not in s3_gtiff_merged:
+                    s3_gtiff_merged[_var] = {}
+                s3_gtiff_merged[_var].update(_date_dict)
+        self._preprocess_results[self.name_s3] = s3_gtiff_merged
 
         # Split the different bands of the sentinel2 file. Save as geotiff
         output_files_s2 = self._download_results[self.name_s2][
@@ -811,10 +854,79 @@ class SenETDownload:
         ##################################################################
 
         # Warp to correct epsg, resolution and extent:
-        # Find a S2 reference file
-        s2_ref_file = list(
-            self._preprocess_results[self.name_s2]['B02'].values())[0]
+        # Find and validate a S2 reference file (B02).
+        s2_b02_dict = self._preprocess_results[self.name_s2].get('B02', {})
+        if len(s2_b02_dict) == 0:
+            raise RuntimeError('No Sentinel-2 B02 files available '
+                               'for preprocessing.')
+
+        corrupt_s2_dates = set()
+        s2_ref_file = None
+        for _s2_date, _s2_file in list(s2_b02_dict.items()):
+            try:
+                with rasterio.open(_s2_file, 'r'):
+                    pass
+            except Exception as ex:
+                self._log.warning(
+                    f'Unreadable S2 B02 file detected ({_s2_file.name}): '
+                    f'{ex}. Will skip timestamp {_s2_date}.')
+                corrupt_s2_dates.add(_s2_date)
+                continue
+
+            if s2_ref_file is None:
+                s2_ref_file = _s2_file
+
+        if corrupt_s2_dates:
+            for _band_name in list(self._preprocess_results[self.name_s2]
+                                   .keys()):
+                for _date in corrupt_s2_dates:
+                    self._preprocess_results[self.name_s2][_band_name].pop(
+                        _date, None)
+            self._log.warning(
+                f'Dropped {len(corrupt_s2_dates)} corrupt S2 timestamp(s): '
+                + str(sorted(d.strftime('%Y%m%dT%H%M%S')
+                             for d in corrupt_s2_dates)))
+
+        if s2_ref_file is None:
+            raise RuntimeError(
+                'No readable Sentinel-2 B02 reference raster found. '
+                'Please remove/re-download corrupted S2 files and retry.')
+
         var_names_hr = list()
+
+        # Validate S3 files before warping: detect corrupt/unreadable files
+        # and drop their timestamps from all S3 variables so that the rest
+        # of the time series can still be processed.
+        corrupt_dates = set()
+        for var_name in type(self).S3_WARP_TO_HR:
+            for f_in_date, f_in in list(
+                    self._preprocess_results[self.name_s3].get(
+                        var_name, {}).items()):
+                ds = None
+                try:
+                    ds = gdal.Open(str(f_in))
+                except RuntimeError as ex:
+                    self._log.warning(
+                        f'Unreadable S3 file detected ({f_in.name}): {ex}. '
+                        f'Will skip timestamp {f_in_date}.')
+                    corrupt_dates.add(f_in_date)
+                    continue
+
+                if ds is None:
+                    self._log.warning(
+                        f'Corrupt or unreadable S3 file detected, '
+                        f'will skip timestamp: {f_in.name}')
+                    corrupt_dates.add(f_in_date)
+                ds = None
+        if corrupt_dates:
+            for _var in list(self._preprocess_results[self.name_s3].keys()):
+                for _date in corrupt_dates:
+                    self._preprocess_results[self.name_s3][_var].pop(
+                        _date, None)
+            self._log.warning(
+                f'Dropped {len(corrupt_dates)} corrupt S3 timestamp(s): '
+                + str(sorted(d.strftime('%Y%m%dT%H%M%S')
+                             for d in corrupt_dates)))
 
         # Warp S3 HR
         # TODO: Gdalwarp does not keep scaling and offset parameters
@@ -827,8 +939,9 @@ class SenETDownload:
                 f_out = f_in.parent / \
                     str(f_in.name).replace(var_name, var_name_hr)
 
-                self._log.debug(f'Creating HiRes {f_in.name}')
-                type(self).warp_s3_to_S2(f_in, f_out, s2_ref_file, np.nan)
+                if not f_out.exists():
+                    self._log.debug(f'Creating HiRes {f_in.name}')
+                    type(self).warp_s3_to_S2(f_in, f_out, s2_ref_file, np.nan)
 
                 self._preprocess_results[self.name_s3][var_name_hr][
                     f_in_date] = f_out
@@ -941,16 +1054,41 @@ class SenETDownload:
         scale = True  # Temporary disable scaling.
         if scale:
             scaling_data = type(self).get_scaling_data()
+            s3_required_for_pipeline = {
+                'LST', 'inc', 'quality_flag',
+                'viewZenithAnglesHR', 'latHR', 'lonHR'
+            }
 
             # Do S3
-            for var_name in self._preprocess_results[self.name_s3].keys():
-                for f_in in self._preprocess_results[self.name_s3][
-                        var_name].values():
+            for var_name in list(self._preprocess_results[self.name_s3].keys()):
+                for f_in_date, f_in in list(
+                        self._preprocess_results[self.name_s3][
+                            var_name].items()):
                     var_scaling_data = scaling_data[self.name_s3].get(
                         var_name, None)
                     if var_scaling_data is not None:
                         self._log.debug(f'Apply S3 Scale/offset {f_in.name}')
-                        type(self).to_scaled_raster(f_in, **var_scaling_data)
+                        try:
+                            type(self).to_scaled_raster(
+                                f_in, **var_scaling_data)
+                        except rasterio.errors.RasterioIOError as ex:
+                            if var_name in s3_required_for_pipeline:
+                                raise RuntimeError(
+                                    f'Corrupt required S3 raster: {f_in}. '
+                                    'Please remove/re-download this scene '
+                                    'and rerun preprocessing.') from ex
+
+                            self._log.warning(
+                                f'Skipping unreadable optional S3 raster '
+                                f'{f_in.name} ({var_name}, '
+                                f'{f_in_date}): {ex}')
+                            try:
+                                if f_in.exists():
+                                    f_in.unlink()
+                            except Exception:
+                                pass
+                            self._preprocess_results[self.name_s3][
+                                var_name].pop(f_in_date, None)
 
             # Do DEM
             for var_name in self._preprocess_results[self.name_dem].keys():
@@ -2282,6 +2420,47 @@ class SenETDownload:
         return filtered
 
     @staticmethod
+    def _find_covering_s3_netcdfs(
+            nc_dir: Path,
+            t_start: datetime,
+            t_end: datetime) -> List[Path]:
+        """Return a sorted list of ``datacube_s3_*.nc`` files in *nc_dir*
+        whose combined temporal coverage spans ``[t_start, t_end]``
+        without internal gaps.
+
+        Filenames are expected to encode their temporal range as
+        ``datacube_s3_YYYYMMDD_YYYYMMDD.nc`` (the format produced by
+        :attr:`_temporal_pkl_suffix`).  Files that do not match this pattern
+        are silently ignored.
+
+        Returns an empty list when the existing files do not fully cover the
+        requested extent or when no matching files are found.
+        """
+        pat = re.compile(r'datacube_s3_(\d{8})_(\d{8})\.nc')
+        candidates: List[tuple] = []
+        for f in sorted(nc_dir.glob('datacube_s3_*.nc')):
+            m = pat.match(f.name)
+            if m:
+                fs = datetime.strptime(m.group(1), '%Y%m%d')
+                fe = datetime.strptime(m.group(2), '%Y%m%d')
+                candidates.append((fs, fe, f))
+        if not candidates:
+            return []
+        # Sort by start date and verify contiguous coverage of [t_start, t_end]
+        candidates.sort(key=lambda x: x[0])
+        if candidates[0][0] > t_start:
+            return []  # earliest file starts after the requested start
+        covered_up_to = candidates[0][1]
+        for fs, fe, _ in candidates[1:]:
+            if fs > covered_up_to + timedelta(days=1):
+                return []  # gap detected between consecutive files
+            covered_up_to = max(covered_up_to, fe)
+        if covered_up_to < t_end:
+            return []  # files do not reach the requested end date
+        # Return only files that overlap the requested range
+        return [f for fs, fe, f in candidates if fe >= t_start and fs <= t_end]
+
+    @staticmethod
     def _convert_spatial_extent(
             spatial_extent: Union[Path,
                                   Dict[str, float],
@@ -2438,7 +2617,8 @@ class SenETDownload:
             confidence_bitlayers = f.parent / \
                 f"confidence_in_bitlayers_{date_str}.tif"
 
-            SenETDownload.convert_s3_confidence_in(f, confidence_bitlayers)
+            if not confidence_bitlayers.exists():
+                SenETDownload.convert_s3_confidence_in(f, confidence_bitlayers)
 
             gtiff_dict['confidence_in_bitlayers'][dt] = confidence_bitlayers
 
@@ -2541,18 +2721,19 @@ class SenETDownload:
             output_dict[name] = dict()
             if 't' in data_array.dims:
                 for t in xar_in['t'].values:
-                    data = data_array.sel(t=t)
-                    if data.dtype == 'float64' and force_f32:
-                        data = data.astype('float32')
                     t = pd.Timestamp(t)
                     str_date = t.strftime('%Y%m%dT%H%M%SZ')
                     output_file = output_dir / f"{name}-{str_date}.tif"
-                    data.rio.write_crs(epsg, inplace=True)
-                    data.rio.to_raster(output_file, compress='deflate')
-
                     dt = datetime(t.year, t.month, t.day, t.hour,
                                   t.minute, t.second, t.microsecond)
                     output_dict[name][dt] = output_file
+                    if output_file.exists():
+                        continue  # already converted in a prior run
+                    data = data_array.sel(t=t)
+                    if data.dtype == 'float64' and force_f32:
+                        data = data.astype('float32')
+                    data.rio.write_crs(epsg, inplace=True)
+                    data.rio.to_raster(output_file, compress='deflate')
 
         # Write dimension grid
         if write_dims:
@@ -2577,14 +2758,16 @@ class SenETDownload:
                 output_file_x = output_dir / f"{name_x}-{str_date}.tif"
                 output_file_y = output_dir / f"{name_y}-{str_date}.tif"
 
-                shutil.copyfile(tmp_x, output_file_x)
-                shutil.copyfile(tmp_y, output_file_y)
-
                 dt = datetime(t.year, t.month, t.day, t.hour,
                               t.minute, t.second, t.microsecond)
 
                 output_dict[name_x][dt] = output_file_x
                 output_dict[name_y][dt] = output_file_y
+
+                if output_file_x.exists() and output_file_y.exists():
+                    continue  # already written in a prior run
+                shutil.copyfile(tmp_x, output_file_x)
+                shutil.copyfile(tmp_y, output_file_y)
 
             tmp_x.unlink()
             tmp_y.unlink()
@@ -2742,11 +2925,21 @@ class SenETDownload:
         else:
             tmp_dst_ds = src_ds.parent / f'tmp_{src_ds.name}'
 
-        with rasterio.open(ref_ds, 'r') as ref:
-            ref_transform = ref.transform
-            # ref_res = ref_transform[0]
-            ref_crs = ref.crs
-            ref_bounds = ref.bounds
+        ref_ds = Path(ref_ds)
+        if not ref_ds.exists():
+            raise FileNotFoundError(
+                f'Reference dataset does not exist: {ref_ds}')
+
+        try:
+            with rasterio.open(ref_ds, 'r') as ref:
+                ref_transform = ref.transform
+                # ref_res = ref_transform[0]
+                ref_crs = ref.crs
+                ref_bounds = ref.bounds
+        except rasterio.errors.RasterioIOError as ex:
+            raise RuntimeError(
+                f'Reference dataset is unreadable or not in a supported '
+                f'format: {ref_ds}. Original error: {ex}') from ex
 
         dst_output_bounds = (ref_bounds.left, ref_bounds.bottom,
                              ref_bounds.right, ref_bounds.top)
@@ -2846,6 +3039,19 @@ class SenETDownload:
             else:
                 pass
                 # Skip
+
+    @staticmethod
+    def _iter_paths(d: dict):
+        """Recursively yield all Path values stored in a (nested) dict."""
+        for v in d.values():
+            if isinstance(v, Path):
+                yield v
+            elif isinstance(v, dict):
+                yield from SenETDownload._iter_paths(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Path):
+                        yield item
 
     @staticmethod
     def set_absolute_paths_dict(relative_root: Path, input_dictionary: dict):

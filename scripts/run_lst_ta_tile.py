@@ -62,16 +62,21 @@ def get_era5_data(era5_tiled_folder, tile, temporal_extent):
 def compute_lst_ta(lst_file, time, elev_file, time_zone,
                    era5col, outfile):
 
-    scale = 0.01
-    nodata = 0
+    out_scale = 0.01
 
     # Get the LST data
     with rasterio.open(lst_file, 'r') as src:
         output_profile = src.profile.copy()
-        lst_data = src.read(1)
+        lst_raw = src.read(1).astype(np.float32)
+        src_nodata = src.nodata
+        # Use file metadata scale so this works for:
+        # - scaled integer LST (e.g. scale=0.01)
+        # - float Kelvin LST (scale=1.0 / no scale tag)
+        src_scale = src.scales[0] if src.scales and src.scales[0] else 1.0
 
-    lst_data = lst_data * scale
-    lst_data[lst_data == nodata] = np.nan
+    lst_data = lst_raw * src_scale
+    if src_nodata is not None:
+        lst_data[lst_raw == src_nodata] = np.nan
 
     # Get the air temperature data from ERA5.
     # Use lst_file as the spatial reference template so that ERA5 T_A1 is
@@ -93,7 +98,7 @@ def compute_lst_ta(lst_file, time, elev_file, time_zone,
     lst_ta = lst_data - np.squeeze(meteo_ts.data)
 
     newnodata = -999
-    lst_ta = lst_ta / scale
+    lst_ta = lst_ta / out_scale
     lst_ta[np.isnan(lst_ta)] = newnodata
     lst_ta = lst_ta.astype(np.int16)
 
@@ -102,7 +107,7 @@ def compute_lst_ta(lst_file, time, elev_file, time_zone,
     # write result to file
     with rasterio.open(outfile, 'w', **output_profile) as dst:
         dst.write(lst_ta, 1)
-        dst.scales = [scale]
+        dst.scales = [out_scale]
         dst.descriptions = ['LST-Ta']
         dst.units = ['K']
         # Generate overviews
@@ -296,20 +301,36 @@ def resample_to_match(src_file: Path, ref_file: Path, dst_file: Path,
 
 
 def _find_external_lst(folder: Path, tile: str, timestamp) -> Path:
-    """Locate an external LST GeoTIFF using the known folder structure:
+    """Locate an external LST GeoTIFF by matching on date (YYYYMMDD) only.
 
-        <folder>/<tile>/<year>/S3-LSTHR/<YYYYMMDDTHHMMSS>/
-            <tile>_S3-LSTHR_<YYYYMMDDTHHMMSS>_COG.tif
+    Searches:
+        <folder>/<tile>/<year>/S3-LSTHR>/*/
+            <tile>_S3-LSTHR_<YYYYMMDD>*_COG.tif
 
-    Returns the Path if it exists, otherwise None.
+    If multiple overpasses exist on the same day, the file whose parent
+    directory name (the overpass timestamp) is closest to *timestamp* is
+    returned.  Returns None if no match is found.
     """
-    timestr = timestamp.strftime('%Y%m%dT%H%M%S')
+    datestr = timestamp.strftime('%Y%m%d')
     year = timestamp.strftime('%Y')
-    expected = (
-        Path(folder) / tile / year / 'S3-LSTHR' / timestr
-        / f'{tile}_S3-LSTHR_{timestr}_COG.tif'
-    )
-    return expected if expected.exists() else None
+    search_dir = Path(folder) / tile / year / 'S3-LSTHR'
+    if not search_dir.exists():
+        return None
+    matches = sorted(search_dir.glob(
+        f'*/{tile}_S3-LSTHR_{datestr}*_COG.tif'))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    # Multiple overpasses on the same day — pick closest to the S3 timestamp
+    def _parse_dir_ts(p):
+        try:
+            return pd.Timestamp(p.parent.name)
+        except Exception:
+            return pd.NaT
+    return min(matches,
+               key=lambda p: abs((_parse_dir_ts(p) - timestamp)
+                                 .total_seconds()))
 
 
 def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
@@ -577,6 +598,12 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
                     et_histogram=et_histogram,
                 )
 
+        # Clean up LSTM-like intermediates
+        inp30_path = output_dir / tile / '008_lstm-like' / 'inputs_30m'
+        if inp30_path.exists():
+            logger.info('Cleaning up LSTM-like intermediate files...')
+            shutil.rmtree(inp30_path)
+
     logger.info('** All done!')
 
 
@@ -585,9 +612,14 @@ if __name__ == "__main__":
     # NOTE that in order to avoid processing issues, the temporal extent
     # should be limited to a maximum of 6 months.
 
-    tiles = ['31UFS']
-    temporal_extent = ['2024-10-01', '2024-12-31']#01-01 04-30, 05-01 09-30,10-01 12-31
-    output_dir = Path('/vitodata/CHILL_Y/OPENEO/31UFS/')
+    tiles = ['35VMF']#31UFS , '35VMF', '32UPC
+    temporal_blocks = [
+        ['2024-01-01', '2024-04-30'],
+        ['2024-05-01', '2024-09-30'],
+        ['2024-10-01', '2024-12-31'],
+    ]
+    # Use a common root output directory; per-tile folders are created inside.
+    output_dir = Path('/vitodata/CHILL_Y/OPENEO/2024')
     era5_tiled_folder = Path('/vitodata/CHILL_Y/data/ERA5')
     time_zone = 0
 
@@ -624,7 +656,7 @@ if __name__ == "__main__":
     # Files are matched to S3 timestamps by date (YYYYMMDD in the filename).
     # Set to None to use the standard sharpened LST (default behaviour).
     # -------------------------------------------------------------------------
-    external_lst_folder = None
+    external_lst_folder = Path('/vitodata/CHILL_Y/LSTMLikeDataset/')
     # external_lst_folder = Path('/vitodata/CHILL_Y/LSTMLikeDataset/')
 
     # Number of months per BIOPAR OpenEO job. Splitting into smaller chunks
@@ -644,14 +676,19 @@ if __name__ == "__main__":
     max_concurrent_jobs = 4
 
     for tile in tiles:
-        main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
-             residual_correction, corr_parameters,
-             generate_lstm_like=generate_lstm_like,
-             et_histogram=et_histogram,
-             compute_et_tseb=compute_et_tseb,
-             min_valid_s3_fraction=min_valid_s3_fraction,
-             mask_to_s3_coverage=mask_to_s3_coverage,
-             external_lst_folder=external_lst_folder,
-             biopar_chunk_months=biopar_chunk_months,
-             s2_chunk_months=s2_chunk_months,
-             max_concurrent_jobs=max_concurrent_jobs)
+        for temporal_extent in temporal_blocks:
+            logger.info(
+                f'** Processing tile {tile} for block '
+                f'{temporal_extent[0]} -> {temporal_extent[1]}')
+            main(tile, temporal_extent, time_zone, output_dir,
+                 era5_tiled_folder,
+                 residual_correction, corr_parameters,
+                 generate_lstm_like=generate_lstm_like,
+                 et_histogram=et_histogram,
+                 compute_et_tseb=compute_et_tseb,
+                 min_valid_s3_fraction=min_valid_s3_fraction,
+                 mask_to_s3_coverage=mask_to_s3_coverage,
+                 external_lst_folder=external_lst_folder,
+                 biopar_chunk_months=biopar_chunk_months,
+                 s2_chunk_months=s2_chunk_months,
+                 max_concurrent_jobs=max_concurrent_jobs)
