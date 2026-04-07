@@ -604,6 +604,12 @@ def main(tile, temporal_extent, time_zone, output_dir, era5_tiled_folder,
             logger.info('Cleaning up LSTM-like intermediate files...')
             shutil.rmtree(inp30_path)
 
+    # Clean up meteo intermediate GeoTIFFs — done here (not inside compute_et)
+    # so that LSTM-like resampling can still read them if generate_lstm_like=True
+    if outdir_meteo.exists():
+        logger.info('Cleaning up meteo intermediate files...')
+        shutil.rmtree(outdir_meteo)
+
     logger.info('** All done!')
 
 
@@ -612,7 +618,7 @@ if __name__ == "__main__":
     # NOTE that in order to avoid processing issues, the temporal extent
     # should be limited to a maximum of 6 months.
 
-    tiles = ['35VMF']#31UFS , '35VMF', '32UPC
+    tiles = ['32UPC']#31UFS , '35VMF', '32UPC
     temporal_blocks = [
         ['2024-01-01', '2024-04-30'],
         ['2024-05-01', '2024-09-30'],

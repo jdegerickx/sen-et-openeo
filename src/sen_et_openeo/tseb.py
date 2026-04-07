@@ -996,24 +996,10 @@ def compute_et(tile, time, lst_file, vza_file, lat_file, lon_file, elev_file,
     del model
     gc.collect()
 
-    # Clean up temporary intermediate files to save storage
+    # Clean up temporary LST conversion file (only needed as TSEB input)
     if lst_k_file.exists():
         logger.debug(f'Removing temporary LST conversion file: {lst_k_file.name}')
         lst_k_file.unlink()
-    
-    # Clean up meteo intermediate GeoTIFFs (only needed for TSEB input)
-    meteo_cleanup = [
-        outdir / f'{timestr}_TA.tif',
-        outdir / f'{timestr}_WS.tif',
-        outdir / f'{timestr}_EA.tif',
-        outdir / f'{timestr}_PA.tif',
-        outdir / f'{timestr}_SW-IN.tif',
-        outdir / f'{datestr}_SW-IN-DD.tif',
-    ]
-    for meteo_file in meteo_cleanup:
-        if meteo_file.exists():
-            logger.debug(f'Removing temporary meteo file: {meteo_file.name}')
-            meteo_file.unlink()
 
     if et_histogram:
         plot_et_histogram(output_file)
