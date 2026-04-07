@@ -82,6 +82,39 @@ After downloading, scale/offset metadata is written into the Sentinel-2 GeoTIFFs
 
 When re-scanning an existing `001_download/` directory (no pkl present), the S2 and BIOPAR GeoTIFF file lists are filtered to only include dates that fall within the current `temporal_extent`, so files from a previous time chunk are never accidentally reused.
 
+#### Chunked download via the Job Manager
+
+For longer time periods or to avoid single large jobs timing out on CDSE, Sentinel-2 and BIOPAR downloads can be split into smaller temporal chunks and managed via the **OpenEO `MultiBackendJobManager`** (requires `openeo-python-client >= 0.31.0`).
+
+This is controlled by two parameters in `download()`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `s2_chunk_months` | `0` | When > 0, the S2 download is split into chunks of this many months, each submitted as a separate OpenEO batch job. `0` = single job (legacy behaviour). |
+| `biopar_chunk_months` | `0` | Same for BIOPAR (LAI, FAPAR, FCOVER). When > 0, one job per *(variable × chunk)* is submitted. `0` = single job per variable. |
+| `max_concurrent_jobs` | `2` | Maximum number of jobs running simultaneously on the CDSE backend. |
+
+**How it works:**
+
+1. The total temporal extent is split into chunks of `chunk_months` months.
+2. One OpenEO batch job is created per chunk (and per BIOPAR variable). All jobs are tracked via a persistent **CSV job database** stored alongside the pkl files:
+   - `s2_jobs_<start>_<end>.csv` — S2 job tracker
+   - `biopar_jobs_<start>_<end>.csv` — BIOPAR job tracker
+3. The `MultiBackendJobManager` polls CDSE until all jobs are `finished` (or `error`/`cancelled`). If the script is interrupted, **re-running it resumes from where it left off** — already-finished jobs are not re-submitted.
+4. Downloaded GeoTIFFs are moved from the job manager's working directory into the standard `S2/` and `BIOPAR/<VAR>/` directories, with filenames normalised to `SENTINEL2_L2A_<date>Z.tif` and `BIOPAR_<VAR>_<date>Z.tif` respectively.
+5. Failed or cancelled jobs are logged as warnings but do not abort the run — the remaining files are still collected and the workflow continues.
+
+**Intermediate files** are written to:
+```
+001_download/
+├── S2/_job_manager/            ← per-job download directories (S2)
+└── BIOPAR/_job_manager/        ← per-job download directories (BIOPAR)
+```
+
+These can be deleted once the download is confirmed complete.
+
+> **Note:** If output files recorded in the pkl are deleted from disk (e.g. to force a re-download), the cached entries are automatically invalidated and the download is re-triggered on the next run.
+
 ---
 
 ### Step 1 — Preprocess (`002_preprocess/`)
