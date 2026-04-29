@@ -884,10 +884,34 @@ def compute_et(tile, time, lst_file, vza_file, lat_file, lon_file, elev_file,
     doy      = time.timetuple().tm_yday
     time_utc = time.hour + time.minute / 60.0 + time.second / 3600.0
 
-    # Match closest biopar date to the S3 overpass time
-    lai_dates = sorted(biopar_dict['LAI'].keys())
-    closest   = min(lai_dates,
-                    key=lambda d: abs((d - time).total_seconds()))
+    # Match the closest biopar date that has the full set required by pyTSEB.
+    required_biopars = ('LAI', 'FAPAR', 'FCOVER')
+    missing_biopars = [name for name in required_biopars if name not in biopar_dict]
+    if missing_biopars:
+        raise KeyError(
+            'Missing required biopar variable(s) for TSEB: '
+            + ', '.join(missing_biopars)
+        )
+
+    common_dates = set(biopar_dict['LAI'].keys())
+    for name in required_biopars[1:]:
+        common_dates &= set(biopar_dict[name].keys())
+
+    if not common_dates:
+        available_dates = {
+            name: sorted(dt_key.strftime('%Y-%m-%dT%H:%M:%S')
+                         for dt_key in biopar_dict[name].keys())
+            for name in required_biopars
+        }
+        raise ValueError(
+            'No common biopar date is available across LAI, FAPAR and '
+            f'FCOVER for TSEB. Available dates: {available_dates}'
+        )
+
+    closest = min(
+        common_dates,
+        key=lambda d: abs((d - time).total_seconds()),
+    )
 
     # F_G, H_C and landcover remap are per biopar date — compute once and cache
     if biopar_cache_dir is None:

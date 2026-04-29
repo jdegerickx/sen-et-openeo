@@ -109,6 +109,7 @@ class SenETDownload:
 
     DOWNLOAD_RETRIES = 3  # Retry count when data is not available
     RETRY_DELAY = 30  # In seconds
+    BIOPAR_CHUNK_RETRIES = 2  # Extra retries for failed/cancelled chunks
 
     # UDF's
     UDF_SZA_S3_FILE = sen_et_openeo.udf.filter_sza_s3.__file__
@@ -612,11 +613,30 @@ class SenETDownload:
         # If chunked BIOPAR download is requested, run it now via the
         # MultiBackendJobManager and merge the results into the download dict.
         if download_biopar and biopar_chunk_months > 0:
-            _biopar_done = all(
-                f'BIOPAR_{_v}' in self._download_results
-                and self._download_results[f'BIOPAR_{_v}'].get('output_files')
+            _biopar_file_counts = {
+                _v: len(self._download_results.get(
+                    f'BIOPAR_{_v}', {}).get('output_files', []))
                 for _v in type(self).BIOPAR_VARIABLES
+            }
+            _max_biopar_count = max(_biopar_file_counts.values(), default=0)
+            # All BIOPAR variables are computed from the same S2 scenes, so
+            # they must all produce the same number of output files. A count
+            # mismatch means some chunked jobs failed and the incomplete
+            # variable(s) must be re-downloaded.
+            _biopar_done = (
+                _max_biopar_count > 0
+                and all(c == _max_biopar_count
+                        for c in _biopar_file_counts.values())
             )
+            if not _biopar_done:
+                for _v, _c in _biopar_file_counts.items():
+                    if 0 < _c < _max_biopar_count:
+                        self._log.warning(
+                            f'BIOPAR_{_v}: only {_c} file(s) found vs '
+                            f'{_max_biopar_count} for other variable(s) — '
+                            f'clearing cached entry to trigger re-download '
+                            f'of missing chunks.')
+                        self._download_results.pop(f'BIOPAR_{_v}', None)
             if _biopar_done:
                 self._log.info(
                     'BIOPAR already available. Skipping chunked download.')
@@ -799,6 +819,30 @@ class SenETDownload:
                     f'file(s) are missing from disk '
                     f'(e.g. {missing[0].name}). Re-running preprocessing.')
                 self._preprocess_results = None
+            # Cache can also be stale when download() has produced new BIOPAR
+            # files but an older preprocess pkl still points to a partial set.
+            # If counts differ, force preprocessing to rebuild the mapping.
+            elif self._download_results is not None:
+                biopar_count_mismatch = []
+                for _var in type(self).BIOPAR_VARIABLES:
+                    _download_key = f'BIOPAR_{_var}'
+                    _download_count = len(
+                        self._download_results.get(
+                            _download_key, {}).get('output_files', []))
+                    _preprocess_count = len(
+                        self._preprocess_results.get(_var, {}))
+                    if _download_count != _preprocess_count:
+                        biopar_count_mismatch.append(
+                            (_var, _preprocess_count, _download_count))
+
+                if biopar_count_mismatch:
+                    _v, _p, _d = biopar_count_mismatch[0]
+                    self._log.warning(
+                        'Preprocess pkl appears stale for BIOPAR: '
+                        f'{_v} has {_p} mapped file(s) in pkl but '
+                        f'{_d} downloaded file(s) on disk. '
+                        'Re-running preprocessing.')
+                    self._preprocess_results = None
             else:
                 self._log.info(
                     'Data already preprocessed. Loading results.')
@@ -1809,21 +1853,51 @@ class SenETDownload:
         )
         manager.add_backend('cdse', connection=eoconn,
                             parallel_jobs=max_concurrent_jobs)
-        manager.run_jobs(
-            df=jobs_df,
-            start_job=start_job,
-            job_db=CsvJobDatabase(job_db_path),
-        )
+
+        # Retry transient failed/cancelled chunks instead of silently
+        # continuing with partial BIOPAR coverage.
+        pending_df = jobs_df.copy()
+        max_attempts = type(self).BIOPAR_CHUNK_RETRIES + 1
+        attempt = 1
+        while True:
+            self._log.info(
+                f'BIOPAR chunked submission attempt '
+                f'{attempt}/{max_attempts}: {len(pending_df)} job(s)')
+            manager.run_jobs(
+                df=pending_df,
+                start_job=start_job,
+                job_db=CsvJobDatabase(job_db_path),
+            )
+
+            job_db_df = pd.read_csv(job_db_path)
+            failed = job_db_df[
+                job_db_df['status'].isin(['error', 'cancelled'])]
+            if failed.empty:
+                break
+
+            self._log.warning(
+                f'BIOPAR chunked: {len(failed)} job(s) failed/cancelled '
+                f'after attempt {attempt}/{max_attempts}:\n'
+                + failed[['biopar_var', 'start_date',
+                           'end_date', 'status']].to_string(index=False))
+
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    'BIOPAR chunked download exhausted retries with '
+                    f'{len(failed)} failed/cancelled job(s). '
+                    'Please rerun, or inspect backend/job logs.')
+
+            pending_df = failed[
+                ['biopar_var', 'start_date', 'end_date']
+            ].drop_duplicates().reset_index(drop=True)
+            attempt += 1
+            self._log.info(
+                f'Retrying failed BIOPAR chunks in '
+                f'{type(self).RETRY_DELAY} seconds...')
+            time.sleep(type(self).RETRY_DELAY)
 
         # ── move downloaded files to per-variable dirs ─────────────────────
         job_db_df = pd.read_csv(job_db_path)
-        failed = job_db_df[
-            job_db_df['status'].isin(['error', 'cancelled'])]
-        if not failed.empty:
-            self._log.warning(
-                f'BIOPAR chunked: {len(failed)} job(s) failed/cancelled:\n'
-                + failed[['biopar_var', 'start_date',
-                           'end_date', 'status']].to_string(index=False))
 
         for _, row in job_db_df[
                 job_db_df['status'] == 'finished'].iterrows():
