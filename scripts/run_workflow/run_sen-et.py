@@ -1,17 +1,13 @@
 """
 This script generates timeseries of LST-Ta (Land Surface Temperature -
-air temperature) and NDVI (Normalized Difference Vegetation Index)
+air temperature), NDVI (Normalized Difference Vegetation Index) and 
+TSEB-PT ET (Two-Source Energy Balance - Priestley-Taylor evapotranspiration)
 for one or multiple Sentinel-2 tiles.
 The required inputs are downloaded from the Copernicus Data
 Space Ecosystem (CDSE) using OpenEO and from the Copernicus Climate
 Data Store (CDS).
 
-Before computing the LST-Ta indicator, the LST data from Sentinel-3
-is sharpened to 20m using Sentinel-2 and Copernicus DEM. After that,
-additional bias and directionality correction is done based on
-comparison with ECOSTRESS data. The computation of these correction
-parameters is done in a separate series of Python scripts:
-https://github.com/SnydersLouis/wasdi_ecostress
+Full description of the workflow and processing steps can be found in the README.md file.
 """
 
 from pathlib import Path

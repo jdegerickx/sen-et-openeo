@@ -565,7 +565,7 @@ def collect_paired_data(
                     if not et_dir.is_dir():
                         logger.warning(
                             f"  {site_id} / {tile} / {et_sub}: directory not found under "
-                            f"{output_root_i} — run run_lst_ta_tile.py for tile {tile} first"
+                            f"{output_root_i} — run run_sen-et.py for tile {tile} first"
                         )
                         continue
 
@@ -573,7 +573,7 @@ def collect_paired_data(
                     if not vrts:
                         logger.warning(
                             f"  {site_id} / {tile} / {et_sub}: no TSEB-PT VRTs found under "
-                            f"{output_root_i} — run run_lst_ta_tile.py for tile {tile} first"
+                            f"{output_root_i} — run run_sen-et.py for tile {tile} first"
                         )
                         continue
 
@@ -1540,7 +1540,7 @@ def main(
         output_root / <tile> / <et_subdir> for every S2 tile that
         contains an ICOS tower.  A clear warning is emitted for any
         tower whose tile directory does not yet exist (run
-        run_lst_ta_tile.py for that tile first).
+        run_sen-et.py for that tile first).
     output_dir:
         Where to save figures and CSV files.
     et_subdirs:
@@ -1768,10 +1768,10 @@ if __name__ == "__main__":
     # Folder containing ICOS ZIP archives
     ICOS_ARCHIVE_DIR = Path("/path/to/ICOS/ETC_L2_ARCHIVE")
 
-    # Root of the pyTSEB output tree (same as output_dir in run_lst_ta_tile.py)
+    # Root of the pyTSEB output tree (same as output_dir in run_sen-et.py)
     # The script automatically locates the correct S2 tile for every ICOS
     # tower using the bundled S2 grid GeoJSON and scans that tile's output
-    # directory.  Run run_lst_ta_tile.py for any missing tiles first.
+    # directory.  Run run_sen-et.py for any missing tiles first.
     OUTPUT_ROOT = [
         Path("/path/to/output/2024"),
         Path("/path/to/output/2025"),
