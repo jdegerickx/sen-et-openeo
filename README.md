@@ -5,11 +5,13 @@ SenET was originally developed within the Sen4ET ESA project (https://www.esa-se
 
 The main output of this workflow is a thermal water stress indicator **LST-Ta** (Land Surface Temperature minus air temperature), as well as an evapotranspiration estimate computed with the **TSEB-PT** (Two-Source Energy Balance – Priestley-Taylor) model.
 
+The script now runs a complete multi-step processing chain: OpenEO/CDSE download, preprocessing and harmonisation, Sentinel-3 LST sharpening, optional ECOSTRESS-based correction, LST-Ta and NDVI export, TSEB-PT ET modelling, and optional generation of LSTM-like 30 m LST, LST-Ta and ET products. For longer periods, downloads can be chunked into smaller OpenEO jobs, and each processing step is cached so interrupted runs can resume automatically.
+
 In addition to the LST sharpening as developed within Sen4ET, additional bias and directionality corrections based on intercomparison of sharpened Sentinel-3 LST data with ECOSTRESS LST data have been added.
 All scripts required to compute these correction coefficients can be found in the `scripts/corrections_ecostress/` folder.
 
 At the end of the main script, all required files are prepared to upload the final results to the Food Security TEP platform.
-Actual data upload can be done using the `scripts/upload_fstep.py` script.
+Actual data upload is completely optional and can be done using the scripts located under `scripts/FSTEP_upload` script.
 
 ---
 
@@ -34,7 +36,7 @@ pip install -e .
 ---
 
 ## Required user accounts
-Before being able to execute the main script `scripts/run_lst_ta_tile.py`, the following user accounts are needed:
+Before being able to execute the main script `scripts/run_sen-et.py`, the following user accounts are needed:
 
 - **Copernicus Data Space Ecosystem (CDSE)** — register here:
   https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/auth?client_id=cdse-public&response_type=code&scope=openid&redirect_uri=https%3A//dataspace.copernicus.eu/account/confirmed/1
@@ -48,17 +50,17 @@ Before being able to execute the main script `scripts/run_lst_ta_tile.py`, the f
 
 ## Processing pipeline
 
-The full workflow is executed by `scripts/run_lst_ta_tile.py` and consists of the following steps, implemented in `src/sen_et_openeo/`:
+The full workflow is executed by `scripts/run_sen-et.py` and consists of the following steps, implemented in `src/sen_et_openeo/`:
 
 ```
 Step 0 — Download          (data_download.py  →  001_download/)
 Step 1 — Preprocess        (data_download.py  →  002_preprocess/)
 Step 2 — LST Sharpening    (data_download.py  →  003_sharpening/)
 Step 3 — LST Correction    (data_download.py  →  004_lst-correction/)   [optional]
-Step 4 — LST-Ta            (run_lst_ta_tile.py → 005_lst-ta/)
-Step 5 — NDVI export       (run_lst_ta_tile.py → 006_ndvi/)
+Step 4 — LST-Ta            (run_sen-et.py → 005_lst-ta/)
+Step 5 — NDVI export       (run_sen-et.py → 006_ndvi/)
 Step 6 — ET (TSEB-PT)      (tseb.py           →  007_et/)
-Step 7 — LSTM-like LST + LST-Ta + ET (run_lst_ta_tile.py → 008_lstm-like/ + 008_lstm-ta/ + 008_lstm-et/) [optional]
+Step 7 — LSTM-like LST + LST-Ta + ET (run_sen-et.py → 008_lstm-like/ + 008_lstm-ta/ + 008_lstm-et/) [optional]
 ```
 
 Each step saves its results as a `.pkl` file so that a re-run automatically resumes from the last completed step.
@@ -206,7 +208,7 @@ Examples:
 
 #### Sharpening quality controls
 
-Two user-configurable parameters in `run_lst_ta_tile.py` control sharpening behaviour for low-quality or partially-clouded S3 scenes:
+Two user-configurable parameters in `run_sen-et.py` control sharpening behaviour for low-quality or partially-clouded S3 scenes:
 
 **`min_valid_s3_fraction`** *(default: `0.0`)*
 
@@ -277,7 +279,7 @@ Results are written as VRT files to `007_et/`.
 
 ### Step 7 — LSTM-like LST + LST-Ta + ET at 30 m (`008_lstm-like/` + `008_lstm-ta/` + `008_lstm-et/`) *(optional)*
 
-Produces a 30 m LST product that mimics the spatial characteristics expected from a future **LSTM** (Land Surface Temperature and Microwave) sensor, and derives the corresponding TSEB-PT evapotranspiration at 30 m. Enabled by setting `generate_lstm_like = True` in the `__main__` block of `run_lst_ta_tile.py`.
+Produces a 30 m LST product that mimics the spatial characteristics expected from a future **LSTM** (Land Surface Temperature and Microwave) sensor, and derives the corresponding TSEB-PT evapotranspiration at 30 m. Enabled by setting `generate_lstm_like = True` in the `__main__` block of `run_sen-et.py`.
 
 **7a — LSTM-like LST (`008_lstm-like/`)**
 
