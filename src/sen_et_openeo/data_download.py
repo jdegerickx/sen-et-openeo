@@ -822,7 +822,7 @@ class SenETDownload:
             # Cache can also be stale when download() has produced new BIOPAR
             # files but an older preprocess pkl still points to a partial set.
             # If counts differ, force preprocessing to rebuild the mapping.
-            elif self._download_results is not None:
+            if self._download_results is not None:
                 biopar_count_mismatch = []
                 for _var in type(self).BIOPAR_VARIABLES:
                     _download_key = f'BIOPAR_{_var}'
@@ -843,11 +843,14 @@ class SenETDownload:
                         f'{_d} downloaded file(s) on disk. '
                         'Re-running preprocessing.')
                     self._preprocess_results = None
-            else:
+            
+            # Decide here whether to return early or to re-run preprocessing
+            if self._preprocess_results is not None:
                 self._log.info(
                     'Data already preprocessed. Loading results.')
                 return self._preprocess_results
 
+        # START OF PREPROCESSING
         # Check on download_results
         if self._download_results is None:
             raise RuntimeError('Download should be done before preprocess')
@@ -2074,7 +2077,7 @@ class SenETDownload:
                 if spatial_extent_loaded == self._spatial_extent and \
                    temporal_extent_loaded == temporal_extent_dt:
                     self._log.info(
-                        'Data already downloaded; '
+                        'Data already present; '
                         'returning results from data.pkl')
                     return dict_in
                 else:
