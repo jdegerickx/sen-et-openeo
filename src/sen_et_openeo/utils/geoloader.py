@@ -20,7 +20,7 @@ import xarray as xr
 
 from rasterio.errors import RasterioIOError
 
-from skimage.transform import rescale
+from skimage.transform import resize
 
 
 from sen_et_openeo.utils.geotiff import (get_rasterio_profile,
@@ -358,12 +358,17 @@ class ParallelLoader:
     def _resample_arr(arr, scale, order):
         dtype_ori = arr.dtype
         arr = np.transpose(arr, [1, 2, 0])
-        arr = rescale(arr,
-                      scale=scale,
-                      order=order,
-                      preserve_range=True,
-                      multichannel=True,
-                      anti_aliasing=True)
+        
+        # Calculate new shape based on scale factor
+        new_shape = (int(arr.shape[0] * scale), 
+                     int(arr.shape[1] * scale), 
+                     arr.shape[2])
+        
+        arr = resize(arr,
+                    output_shape=new_shape,
+                    order=order,
+                    preserve_range=True,
+                    anti_aliasing=(order > 0))
 
         arr = np.transpose(arr, [2, 0, 1])
         arr = arr.astype(dtype_ori)
@@ -679,27 +684,28 @@ def _getECMWFTempInterpData(ncfile, var_name, before_I, after_I, frac):
     scale = ds.GetRasterBand(before_I+1).GetScale()
     offset = ds.GetRasterBand(before_I+1).GetOffset()
     no_data_value = ds.GetRasterBand(before_I+1).GetNoDataValue()
+    # Newer ERA5 files store data in physical units — GDAL reports None
+    scale = scale if scale is not None else 1.0
+    offset = offset if offset is not None else 0.0
     gt = ds.GetGeoTransform()
     sr = osr.SpatialReference()
     sr.ImportFromEPSG(4326)
     proj = sr.ExportToWkt()
 
+    def _apply_scale_nodata(data, scale, offset, nodata):
+        data = data.astype(float) * scale + offset
+        if nodata is not None and not np.isnan(nodata):
+            data[data == nodata] = np.nan
+        return data
+
     # Read the right time layers
     try:
         data_before = ds.GetRasterBand(before_I+1).ReadAsArray()
-        if scale is not None:
-            data_before = data_before.astype(float) * scale
-        if offset is not None:
-            data_before = data_before + offset
-        if ~np.isnan(no_data_value):
-            data_before[data_before == no_data_value] = np.nan
+        data_before = _apply_scale_nodata(
+            data_before, scale, offset, no_data_value)
         data_after = ds.GetRasterBand(after_I+1).ReadAsArray()
-        if scale is not None:
-            data_after = data_after.astype(float) * scale
-        if offset is not None:
-            data_after = data_after + offset
-        if ~np.isnan(no_data_value):
-            data_after[data_after == no_data_value] = np.nan
+        data_after = _apply_scale_nodata(
+            data_after, scale, offset, no_data_value)
     except AttributeError:
         ds = None
         raise RuntimeError(
@@ -708,16 +714,19 @@ def _getECMWFTempInterpData(ncfile, var_name, before_I, after_I, frac):
     # Perform temporal interpolation
     data = data_before*frac + data_after*(1.0-frac)
 
+    ds = None  # close GDAL dataset explicitly
     return data, gt, proj
 
 
 def get_timing(ncfile, date_time):
 
     # Open the netcdf time dataset
+    # ERA5 files may use 'valid_time' (newer CDS API) or 'time' (legacy)
     fid = netCDF4.Dataset(ncfile, 'r')
-    time = fid.variables['time']
+    time_var_name = 'valid_time' if 'valid_time' in fid.variables else 'time'
+    time = fid.variables[time_var_name]
     dates = netCDF4.num2date(time[:], time.units, time.calendar)
-    del fid
+    fid.close()
 
     timing, _, _ = _bracketing_dates(dates, date_time)
     return timing
@@ -747,11 +756,22 @@ def _getECMWFIntegratedData(ncfile, var_name, date_time, time_window=24,):
     scale = ds.GetRasterBand(timing_0+1).GetScale()
     offset = ds.GetRasterBand(timing_0+1).GetOffset()
     no_data_value = ds.GetRasterBand(timing_0+1).GetNoDataValue()
+    # Newer ERA5 files (CDS API v2) store data in physical units already;
+    # GDAL reports scale/offset as None in that case — default to identity.
+    scale = scale if scale is not None else 1.0
+    offset = offset if offset is not None else 0.0
     # Report geolocation of the top-left pixel of rectangle
     gt = ds.GetGeoTransform()
     sr = osr.SpatialReference()
     sr.ImportFromEPSG(4326)
     proj = sr.ExportToWkt()
+
+    def _read_band(ds, band_i, scale, offset, no_data_value):
+        data = ds.GetRasterBand(band_i + 1).ReadAsArray()
+        data = data.astype(float) * scale + offset
+        if no_data_value is not None:
+            data[data == no_data_value] = 0
+        return data
 
     # Forecasts of ERA5 the accumulations are since the
     # previous post processing (archiving)
@@ -765,9 +785,7 @@ def _getECMWFIntegratedData(ncfile, var_name, date_time, time_window=24,):
         # just one file: read the range as computed
         for date_i in range(timing_0+1, timing_1+1):
             # Read the right time layers
-            data = ds.GetRasterBand(date_i+1).ReadAsArray()
-            data = (data.astype(float) * scale) + offset
-            data[data == no_data_value] = 0
+            data = _read_band(ds, date_i, scale, offset, no_data_value)
             # The time step value is the difference between
             # the actual timestep value and the previous value
             cummulated_value += (data - data_ref)
@@ -776,21 +794,22 @@ def _getECMWFIntegratedData(ncfile, var_name, date_time, time_window=24,):
         # first read first file till end
         for date_i in range(timing_0+1, 24):
             # Read the right time layers
-            data = ds.GetRasterBand(date_i+1).ReadAsArray()
-            data = (data.astype(float) * scale) + offset
-            data[data == no_data_value] = 0
+            data = _read_band(ds, date_i, scale, offset, no_data_value)
             cummulated_value += (data - data_ref)
-
-        # now read the second file from start
+        ds = None  # close first file's GDAL handle before opening the second        # now read the second file from start; re-read scale/offset from it
         ds = gdal.Open('NETCDF:"'+ncfile_1+'":'+var_name)
+        scale1 = ds.GetRasterBand(1).GetScale()
+        offset1 = ds.GetRasterBand(1).GetOffset()
+        no_data_value1 = ds.GetRasterBand(1).GetNoDataValue()
+        scale1 = scale1 if scale1 is not None else 1.0
+        offset1 = offset1 if offset1 is not None else 0.0
         for date_i in range(0, timing_1+1):
             # Read the right time layers
-            data = ds.GetRasterBand(date_i+1).ReadAsArray()
-            data = (data.astype(float) * scale) + offset
-            data[data == no_data_value] = 0
+            data = _read_band(ds, date_i, scale1, offset1, no_data_value1)
             cummulated_value += (data - data_ref)
 
     # Convert to average W m^-2
     cummulated_value = cummulated_value / (time_window * 3600.)
 
+    ds = None  # close GDAL dataset explicitly
     return cummulated_value, gt, proj

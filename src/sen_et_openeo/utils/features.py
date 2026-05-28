@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
-from shapely import Polygon
+from shapely.geometry import Polygon
 import scipy
 from loguru import logger
 from shapely.geometry import Point

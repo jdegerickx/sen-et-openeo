@@ -1,11 +1,12 @@
 from pathlib import Path
 from typing import Optional, Union, Dict, Callable, List
 import gc
+import sys
 try:
     from typing import Literal
 except ImportError:
     from typing_extensions import Literal
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import time
 import re
@@ -69,8 +70,9 @@ class SenETDownload:
     # OPENEO_CDSE_URL = "openeo-staging.dataspace.copernicus.eu"
     S2_BAND_NAMES = ["B02", "B03", "B04", "B05",
                      "B06", "B07", "B08", "B8A", "B11", "B12"]
-    S3_BAND_NAMES = ["LST", "LST_uncertainty", "exception", "confidence_in",
-                     "sunAzimuthAngles", "sunZenithAngles",
+    S3_BAND_NAMES1 = ["LST", "LST_uncertainty", "exception", "confidence_in"
+                        ]
+    S3_BAND_NAMES2 = [ "sunAzimuthAngles", "sunZenithAngles",
                      "viewAzimuthAngles", "viewZenithAngles"]
     S3_WARP_TO_HR = ["sunAzimuthAngles", "sunZenithAngles",
                      "viewAzimuthAngles", "viewZenithAngles", 'lat', 'lon']
@@ -93,8 +95,21 @@ class SenETDownload:
         "executor-cores": "1",
     }
 
+    # ESA WorldCover — version depends on the acquisition year of the data:
+    #   before 2021  → ESA_WORLDCOVER_10M_2020_V1  (product year 2020)
+    #   2021 onward  → ESA_WORLDCOVER_10M_2021_V2  (product year 2021)
+    WORLDCOVER_2020 = 'ESA_WORLDCOVER_10M_2020_V1'
+    WORLDCOVER_2021 = 'ESA_WORLDCOVER_10M_2021_V2'
+    WORLDCOVER_CUTOFF_YEAR = 2021   # first year that uses the 2021 product
+    JOB_OPTIONS_WORLDCOVER = {
+        "executor-memory": "4G",
+        "executor-memoryOverhead": "2G",
+        "executor-cores": "1",
+    }
+
     DOWNLOAD_RETRIES = 3  # Retry count when data is not available
     RETRY_DELAY = 30  # In seconds
+    BIOPAR_CHUNK_RETRIES = 2  # Extra retries for failed/cancelled chunks
 
     # UDF's
     UDF_SZA_S3_FILE = sen_et_openeo.udf.filter_sza_s3.__file__
@@ -110,6 +125,17 @@ class SenETDownload:
                          'S2-B05', 'S2-B06', 'S2-B07',
                          'S2-B08', 'S2-B11', 'S2-B12',
                          'DEM-alt-20m', 'S3-inc']
+
+    # Biophysical variables (biopar) for PyTSEB
+    BIOPAR_VARIABLES = ["LAI", "FAPAR", "FCOVER"]
+    BIOPAR_UDP_URL = ("https://raw.githubusercontent.com/ESA-APEx/"
+                     "apex_algorithms/refs/heads/main/algorithm_catalog/"
+                     "vito/biopar/openeo_udp/biopar.json")
+    JOB_OPTIONS_BIOPAR = {
+        "executor-memory": "7G",
+        "executor-memoryOverhead": "4G",
+        "executor-cores": "1",
+    }
 
     # TODO: should be configurable in the instance itself.
     NUM_THREADS_GDAL = 'ALL_CPUS'
@@ -161,12 +187,20 @@ class SenETDownload:
         self.name_s3 = 'SENTINEL3_SLSTR_L2_LST'
         self.name_dem = 'COPERNICUS_30'
 
+        # Choose WorldCover product version based on temporal extent start year
+        start_year = int(str(temporal_extent[0])[:4])
+        if start_year < type(self).WORLDCOVER_CUTOFF_YEAR:
+            self.name_worldcover = type(self).WORLDCOVER_2020
+        else:
+            self.name_worldcover = type(self).WORLDCOVER_2021
+
         self.delete_temp = True
 
         # Set these values to provide jobid's
         self.s2_jobid: Optional[str] = None
         self.s3_jobid: Optional[str] = None
         self.dem_jobid: Optional[str] = None
+        self.worldcover_jobid: Optional[str] = None
 
         # store download results here from download():
         self._download_results: Optional[dict] = None
@@ -174,12 +208,28 @@ class SenETDownload:
         self._preprocess_results: Optional[dict] = None
         # Store sharpening results here from sharpening():
         self._sharpening_results: Optional[dict] = None
+        # Store LST correction results here from lst_correction():
+        self._lst_results: Optional[dict] = None
+        # Store biophysical variable results here from compute_biopar():
+        self._biopar_results: Optional[dict] = None
 
         # See https://gdal.org/programs/gdalwarp.html#cmdoption-gdalwarp-r
         self.warp_resampling_method: str = 'near'
 
         # # Quick and dirty method to prompt the user with a single login url
         # openeo.connect(type(self).OPENEO_URL).authenticate_oidc()
+
+    @property
+    def _temporal_pkl_suffix(self) -> str:
+        """Short string encoding the temporal extent for use in pkl filenames.
+
+        Ensures that runs with different temporal extents (e.g. time chunks)
+        produce separate pkl files and never trigger the extent-mismatch error.
+        Example: temporal_extent=['2024-05-01','2024-06-30'] → '_20240501_20240630'
+        """
+        start = str(self._temporal_extent[0]).replace('-', '')[:8]
+        end   = str(self._temporal_extent[1]).replace('-', '')[:8]
+        return f'_{start}_{end}'
 
     def run(self, output_dir):
         self.download(output_dir)
@@ -189,7 +239,11 @@ class SenETDownload:
 
     def download(self,
                  output_dir: Path,
-                 parallel: bool = True) -> Dict[str, any]:
+                 parallel: bool = True,
+                 download_biopar: bool = True,
+                 biopar_chunk_months: int = 0,
+                 s2_chunk_months: int = 0,
+                 max_concurrent_jobs: int = 2) -> Dict[str, any]:
         """
         Download datacubes from specified sources.
         This method checks if data was already downloaded
@@ -201,6 +255,20 @@ class SenETDownload:
             will be saved.
             parallel (bool, optional): Whether to download datacubes
             in parallel. Defaults to True.
+            download_biopar (bool, optional): Whether to download
+            biophysical variables (LAI, FAPAR, FCOVER). Set to False
+            to skip BIOPAR downloads when ET computation is disabled.
+            Defaults to True.
+            biopar_chunk_months (int, optional): When > 0, BIOPAR jobs are
+            split into chunks of this many months and submitted via
+            MultiBackendJobManager. Set to 0 to use a single job per
+            variable (original behaviour). Defaults to 0.
+            s2_chunk_months (int, optional): When > 0, Sentinel-2 jobs are
+            split into chunks of this many months and submitted via
+            MultiBackendJobManager instead of a single large job. This
+            reduces per-job memory and allows the default executor memory
+            settings to be used. Set to 0 (default) to use a single job
+            covering the full temporal extent.
 
         Returns:
             Dict[str, any]:
@@ -237,7 +305,7 @@ class SenETDownload:
                 }
        """
         # Path where the output_dict is pickled at the end:
-        output_dict_pkl = output_dir / self.tile / 'download.pkl'
+        output_dict_pkl = output_dir / self.tile / f'download{self._temporal_pkl_suffix}.pkl'
 
         # Set output dir
         output_dir = output_dir / self.tile / '001_download'
@@ -245,19 +313,22 @@ class SenETDownload:
 
         # Set output paths
         output_path_s2 = output_dir / 'S2'
-        output_path_s3 = output_dir / 'S3' / 'datacube_s3.nc'
+        output_path_s3 = (
+            output_dir / 'S3'
+            / f'datacube_s3{self._temporal_pkl_suffix}.nc'
+        )
         output_path_dem = output_dir / 'DEM'
 
         # Define datacubes to download
         # Format (NAME, DATACUBE_FUNC, OUTPUT_FILE, JOBID, JOB_OPTIONS)
-        datacubes = [
+        datacubes = ([
             (self.name_s2,
              self._get_datacube_s2,
              output_path_s2,
              'gtiff',
              self.s2_jobid,
              type(self).JOB_OPTIONS_S2),
-
+        ] if s2_chunk_months <= 0 else []) + [
             (self.name_s3,
              self._get_datacube_s3,
              output_path_s3,
@@ -271,24 +342,193 @@ class SenETDownload:
              'gtiff',
              self.dem_jobid,
              type(self).JOB_OPTIONS_DEM),
-        ]
+
+            (self.name_worldcover,
+             self._get_datacube_worldcover,
+             output_dir / 'WorldCover',
+             'gtiff',
+             self.worldcover_jobid,
+             type(self).JOB_OPTIONS_WORLDCOVER),
+        ] + ([
+            (f'BIOPAR_{var}',
+             lambda v=var: self._get_datacube_biopar(v),
+             output_dir / 'BIOPAR' / var,
+             'gtiff',
+             None,
+             type(self).JOB_OPTIONS_BIOPAR)
+            for var in type(self).BIOPAR_VARIABLES
+        ] if (download_biopar and biopar_chunk_months <= 0) else [])
         # If (part of) the data is already downloaded,
-        # load and return the dictionary from the pickle file
-        to_download = [name for name, datacube_func, output_path,
-                       fmt, job_id, job_opts in datacubes]
+        # load the dictionary from the pickle file (if present),
+        # then also scan output directories for any files already on disk.
+        all_names = [name for name, datacube_func, output_path,
+                     fmt, job_id, job_opts in datacubes]
         if output_dict_pkl.is_file():
-            self._log.info('Data already downloaded. Loading results.')
+            self._log.info('Pickle file found. Loading previous results.')
             self._download_results = self._check_and_load_pickled_dict(
                 output_dict_pkl, output_dir)
-            to_download = [n for n in to_download if n not in
-                           list(self._download_results.keys())]
-            datacubes = [dc for dc in datacubes if dc[0] in to_download]
-            if len(datacubes) == 0:
-                return self._download_results
-
         else:
             # Setup the result dict, set some initial values
             self._download_results = self._get_initial_output_dict()
+
+        # Temporal window for filtering existing GeoTIFF files by date.
+        # Only files whose embedded date falls within [t_start, t_end] are
+        # considered as already-downloaded for this temporal chunk.
+        t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        t_end   = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+
+        def _filter_tifs_by_extent(tif_list):
+            return type(self).filter_tifs_by_extent(
+                tif_list, t_start, t_end)
+
+        # Additionally check the output directories for existing files,
+        # even when they are not (yet) recorded in the pickle file.
+        for name, datacube_func, output_path, fmt, job_id, job_opts in datacubes:
+            if name in self._download_results:
+                # Already tracked; ensure output_files list is populated and
+                # that the recorded files still exist on disk (they may have
+                # been deleted after the pkl was written).
+                entry = self._download_results[name]
+                existing = [f for f in entry.get('output_files', [])
+                            if Path(f).is_file()]
+                if not existing:
+                    op = entry.get('output_path', output_path)
+                    if fmt == 'gtiff' and op and Path(op).is_dir():
+                        entry['output_files'] = _filter_tifs_by_extent(
+                            sorted(Path(op).glob('*.tif')))
+                    elif fmt == 'netcdf' and op and Path(op).is_file():
+                        entry['output_files'] = [Path(op)]
+                    elif fmt == 'netcdf':
+                        # Recorded file no longer exists; try to find
+                        # covering NC files from prior chunked runs.
+                        nc_dir = (Path(op).parent
+                                  if op and not Path(op).is_dir()
+                                  else (Path(op) if op else output_path.parent))
+                        covering = type(self)._find_covering_s3_netcdfs(
+                            nc_dir, t_start, t_end)
+                        entry['output_files'] = covering if covering else []
+                    else:
+                        entry['output_files'] = []
+            else:
+                # Not in pickle; check whether files are already on disk.
+                if fmt == 'gtiff' and output_path.is_dir():
+                    existing_files = _filter_tifs_by_extent(
+                        sorted(output_path.glob('*.tif')))
+                    if existing_files:
+                        self._log.info(
+                            f'{name}: found {len(existing_files)} existing '
+                            f'file(s) in {output_path}. Skipping download.')
+                        self._download_results[name] = {
+                            'output_path': output_path,
+                            'fmt': fmt,
+                            'output_files': existing_files}
+                elif fmt == 'netcdf' and output_path.is_file():
+                    self._log.info(
+                        f'{name}: found existing file {output_path}. '
+                        f'Skipping download.')
+                    self._download_results[name] = {
+                        'output_path': output_path,
+                        'fmt': fmt,
+                        'output_files': [output_path]}
+                elif fmt == 'netcdf' and output_path.parent.is_dir():
+                    # Exact file missing – check if multiple NC files from
+                    # prior chunked runs collectively cover the requested
+                    # temporal extent (e.g. 3-month blocks vs full year).
+                    covering = type(self)._find_covering_s3_netcdfs(
+                        output_path.parent, t_start, t_end)
+                    if covering:
+                        self._log.info(
+                            f'{name}: found {len(covering)} existing NC '
+                            f'file(s) that collectively cover the requested '
+                            f'temporal extent. Skipping download.')
+                        self._download_results[name] = {
+                            'output_path': output_path.parent,
+                            'fmt': fmt,
+                            'output_files': covering}
+
+        # For chunked datasets S2 and BIOPAR are excluded from `datacubes`
+        # above, so we need to check for their files on disk separately.
+        if s2_chunk_months > 0:
+            # Verify that any pkl-recorded S2 files still exist on disk;
+            # if they have been removed, clear the stale entry so that
+            # the chunked download is re-triggered below.
+            if self.name_s2 in self._download_results:
+                recorded_s2 = self._download_results[self.name_s2].get(
+                    'output_files', [])
+                if not recorded_s2 or not any(
+                        Path(f).is_file() for f in recorded_s2):
+                    self._log.warning(
+                        f'S2: recorded output files no longer exist on disk. '
+                        f'Clearing cached entry to re-trigger download.')
+                    del self._download_results[self.name_s2]
+            if self.name_s2 not in self._download_results:
+                if output_path_s2.is_dir():
+                    existing_s2 = _filter_tifs_by_extent(
+                        sorted(output_path_s2.glob('*.tif')))
+                    if existing_s2:
+                        self._log.info(
+                            f'S2: found {len(existing_s2)} existing file(s). '
+                            f'Skipping chunked download.')
+                        self._download_results[self.name_s2] = {
+                            'output_path': output_path_s2,
+                            'fmt': 'gtiff',
+                            'output_files': existing_s2,
+                        }
+
+        if download_biopar and biopar_chunk_months > 0:
+            for _bv in type(self).BIOPAR_VARIABLES:
+                _bname = f'BIOPAR_{_bv}'
+                # Verify that any pkl-recorded files still exist on disk;
+                # if they have been removed, clear the stale entry so that
+                # the chunked download is re-triggered below.
+                if _bname in self._download_results:
+                    recorded = self._download_results[_bname].get(
+                        'output_files', [])
+                    if not recorded or not all(
+                            Path(f).is_file() for f in recorded):
+                        self._log.warning(
+                            f'{_bname}: one or more recorded output files no '
+                            f'longer exist on disk. Clearing cached entry to '
+                            f're-trigger download.')
+                        del self._download_results[_bname]
+                if _bname not in self._download_results:
+                    _bdir = output_dir / 'BIOPAR' / _bv
+                    if _bdir.is_dir():
+                        existing_b = _filter_tifs_by_extent(
+                            sorted(_bdir.glob('*.tif')))
+                        if existing_b:
+                            self._log.info(
+                                f'{_bname}: found {len(existing_b)} existing '
+                                f'file(s). Skipping chunked download.')
+                            self._download_results[_bname] = {
+                                'output_path': _bdir,
+                                'fmt': 'gtiff',
+                                'output_files': existing_b,
+                            }
+
+        to_download = [n for n in all_names
+                       if n not in self._download_results]
+        datacubes = [dc for dc in datacubes if dc[0] in to_download]
+
+        # Determine whether any chunked job still needs to run so we do not
+        # return early and skip the chunked download blocks below.
+        _need_chunked_s2 = (
+            s2_chunk_months > 0
+            and not self._download_results.get(
+                self.name_s2, {}).get('output_files'))
+        _need_chunked_biopar = (
+            download_biopar and biopar_chunk_months > 0
+            and not all(
+                self._download_results.get(
+                    f'BIOPAR_{_v}', {}).get('output_files')
+                for _v in type(self).BIOPAR_VARIABLES))
+
+        if len(datacubes) == 0 and not _need_chunked_s2 \
+                and not _need_chunked_biopar:
+            self._log.info('All data already available. Returning results.')
+            return self._download_results
 
         ##################################################################
         # STEP1: Process and download data from OpenEO                   #
@@ -351,6 +591,62 @@ class SenETDownload:
             output_files_s2 = self._download_results[self.name_s2][
                 'output_files']
             type(self)._add_s2_scale_offset(output_files_s2)
+
+        # If chunked S2 download is requested, run it now via the
+        # MultiBackendJobManager and merge the results into the download dict.
+        if s2_chunk_months > 0:
+            _s2_entry = self._download_results.get(self.name_s2)
+            if _s2_entry and _s2_entry.get('output_files'):
+                self._log.info(
+                    'S2 already available. Skipping chunked download.')
+            else:
+                self._log.info(
+                    f'** Running chunked S2 download '
+                    f'({s2_chunk_months}-month chunks)')
+                s2_chunked = self._download_s2_chunked(
+                    output_dir, s2_chunk_months, max_concurrent_jobs)
+                self._download_results.update(s2_chunked)
+                # Apply scale/offset to the newly downloaded S2 files
+                type(self)._add_s2_scale_offset(
+                    self._download_results[self.name_s2]['output_files'])
+
+        # If chunked BIOPAR download is requested, run it now via the
+        # MultiBackendJobManager and merge the results into the download dict.
+        if download_biopar and biopar_chunk_months > 0:
+            _biopar_file_counts = {
+                _v: len(self._download_results.get(
+                    f'BIOPAR_{_v}', {}).get('output_files', []))
+                for _v in type(self).BIOPAR_VARIABLES
+            }
+            _max_biopar_count = max(_biopar_file_counts.values(), default=0)
+            # All BIOPAR variables are computed from the same S2 scenes, so
+            # they must all produce the same number of output files. A count
+            # mismatch means some chunked jobs failed and the incomplete
+            # variable(s) must be re-downloaded.
+            _biopar_done = (
+                _max_biopar_count > 0
+                and all(c == _max_biopar_count
+                        for c in _biopar_file_counts.values())
+            )
+            if not _biopar_done:
+                for _v, _c in _biopar_file_counts.items():
+                    if 0 < _c < _max_biopar_count:
+                        self._log.warning(
+                            f'BIOPAR_{_v}: only {_c} file(s) found vs '
+                            f'{_max_biopar_count} for other variable(s) — '
+                            f'clearing cached entry to trigger re-download '
+                            f'of missing chunks.')
+                        self._download_results.pop(f'BIOPAR_{_v}', None)
+            if _biopar_done:
+                self._log.info(
+                    'BIOPAR already available. Skipping chunked download.')
+            else:
+                self._log.info(
+                    f'** Running chunked BIOPAR download '
+                    f'({biopar_chunk_months}-month chunks)')
+                biopar_chunked = self._download_biopar_chunked(
+                    output_dir, biopar_chunk_months, max_concurrent_jobs)
+                self._download_results.update(biopar_chunked)
 
         # Write the output dictionary to a pickle file
         type(self).pickle_write_dict(output_dict_pkl,
@@ -504,17 +800,57 @@ class SenETDownload:
             }
         """
 
-        output_dict_pkl = output_dir / self.tile / 'preprocess.pkl'
+        output_dict_pkl = output_dir / self.tile / f'preprocess{self._temporal_pkl_suffix}.pkl'
         output_dir = output_dir / self.tile / '002_preprocess'
 
         # If the data is already preprocessed,
-        # load and return the dictionary from the pickle file
+        # load the dictionary from the pickle file and verify that the
+        # recorded files still exist on disk before skipping re-processing.
         if output_dict_pkl.is_file():
             self._preprocess_results = self._check_and_load_pickled_dict(
                 output_dict_pkl, output_dir)
-            self._log.info('Data already preprocessed. Loading results.')
-            return self._preprocess_results
+            missing = [
+                p for p in type(self)._iter_paths(self._preprocess_results)
+                if not p.is_file()
+            ]
+            if missing:
+                self._log.warning(
+                    f'Preprocess pkl found but {len(missing)} recorded '
+                    f'file(s) are missing from disk '
+                    f'(e.g. {missing[0].name}). Re-running preprocessing.')
+                self._preprocess_results = None
+            # Cache can also be stale when download() has produced new BIOPAR
+            # files but an older preprocess pkl still points to a partial set.
+            # If counts differ, force preprocessing to rebuild the mapping.
+            if self._download_results is not None:
+                biopar_count_mismatch = []
+                for _var in type(self).BIOPAR_VARIABLES:
+                    _download_key = f'BIOPAR_{_var}'
+                    _download_count = len(
+                        self._download_results.get(
+                            _download_key, {}).get('output_files', []))
+                    _preprocess_count = len(
+                        self._preprocess_results.get(_var, {}))
+                    if _download_count != _preprocess_count:
+                        biopar_count_mismatch.append(
+                            (_var, _preprocess_count, _download_count))
 
+                if biopar_count_mismatch:
+                    _v, _p, _d = biopar_count_mismatch[0]
+                    self._log.warning(
+                        'Preprocess pkl appears stale for BIOPAR: '
+                        f'{_v} has {_p} mapped file(s) in pkl but '
+                        f'{_d} downloaded file(s) on disk. '
+                        'Re-running preprocessing.')
+                    self._preprocess_results = None
+            
+            # Decide here whether to return early or to re-run preprocessing
+            if self._preprocess_results is not None:
+                self._log.info(
+                    'Data already preprocessed. Loading results.')
+                return self._preprocess_results
+
+        # START OF PREPROCESSING
         # Check on download_results
         if self._download_results is None:
             raise RuntimeError('Download should be done before preprocess')
@@ -538,17 +874,24 @@ class SenETDownload:
             self)._extract_dem_features(output_file_dem,
                                         output_dir_dem)
 
-        # Single S3 netcdf file, convert to geotiff
-        output_file_s3 = self._download_results[self.name_s3][
-            'output_files'][0]
+        # One or more S3 netcdf files (multiple when prior chunked runs
+        # already exist on disk); convert each and merge the per-timestamp
+        # GeoTIFF dictionaries so that all timestamps are available.
+        output_files_s3 = self._download_results[self.name_s3]['output_files']
         output_dir_s3 = output_dir / 'S3'
-        self._preprocess_results[self.name_s3] = type(
-            self)._netcdf_to_geotiff_s3(output_file_s3,
-                                        output_dir_s3,
-                                        force_f32=True)
+        s3_gtiff_merged: Dict[str, Dict[datetime, Path]] = {}
+        for _nc in output_files_s3:
+            _partial = type(self)._netcdf_to_geotiff_s3(
+                _nc, output_dir_s3, force_f32=True)
+            for _var, _date_dict in _partial.items():
+                if _var not in s3_gtiff_merged:
+                    s3_gtiff_merged[_var] = {}
+                s3_gtiff_merged[_var].update(_date_dict)
+        self._preprocess_results[self.name_s3] = s3_gtiff_merged
 
         # Split the different bands of the sentinel2 file. Save as geotiff
-        output_files_s2 = self._download_results[self.name_s2]['output_files']
+        output_files_s2 = self._download_results[self.name_s2][
+            'output_files']
         output_dir_s2 = output_dir / 'S2'
         self._preprocess_results[self.name_s2] = type(
             self)._split_geotiff_s2(output_files_s2, output_dir_s2)
@@ -558,10 +901,79 @@ class SenETDownload:
         ##################################################################
 
         # Warp to correct epsg, resolution and extent:
-        # Find a S2 reference file
-        s2_ref_file = list(
-            self._preprocess_results[self.name_s2]['B02'].values())[0]
+        # Find and validate a S2 reference file (B02).
+        s2_b02_dict = self._preprocess_results[self.name_s2].get('B02', {})
+        if len(s2_b02_dict) == 0:
+            raise RuntimeError('No Sentinel-2 B02 files available '
+                               'for preprocessing.')
+
+        corrupt_s2_dates = set()
+        s2_ref_file = None
+        for _s2_date, _s2_file in list(s2_b02_dict.items()):
+            try:
+                with rasterio.open(_s2_file, 'r'):
+                    pass
+            except Exception as ex:
+                self._log.warning(
+                    f'Unreadable S2 B02 file detected ({_s2_file.name}): '
+                    f'{ex}. Will skip timestamp {_s2_date}.')
+                corrupt_s2_dates.add(_s2_date)
+                continue
+
+            if s2_ref_file is None:
+                s2_ref_file = _s2_file
+
+        if corrupt_s2_dates:
+            for _band_name in list(self._preprocess_results[self.name_s2]
+                                   .keys()):
+                for _date in corrupt_s2_dates:
+                    self._preprocess_results[self.name_s2][_band_name].pop(
+                        _date, None)
+            self._log.warning(
+                f'Dropped {len(corrupt_s2_dates)} corrupt S2 timestamp(s): '
+                + str(sorted(d.strftime('%Y%m%dT%H%M%S')
+                             for d in corrupt_s2_dates)))
+
+        if s2_ref_file is None:
+            raise RuntimeError(
+                'No readable Sentinel-2 B02 reference raster found. '
+                'Please remove/re-download corrupted S2 files and retry.')
+
         var_names_hr = list()
+
+        # Validate S3 files before warping: detect corrupt/unreadable files
+        # and drop their timestamps from all S3 variables so that the rest
+        # of the time series can still be processed.
+        corrupt_dates = set()
+        for var_name in type(self).S3_WARP_TO_HR:
+            for f_in_date, f_in in list(
+                    self._preprocess_results[self.name_s3].get(
+                        var_name, {}).items()):
+                ds = None
+                try:
+                    ds = gdal.Open(str(f_in))
+                except RuntimeError as ex:
+                    self._log.warning(
+                        f'Unreadable S3 file detected ({f_in.name}): {ex}. '
+                        f'Will skip timestamp {f_in_date}.')
+                    corrupt_dates.add(f_in_date)
+                    continue
+
+                if ds is None:
+                    self._log.warning(
+                        f'Corrupt or unreadable S3 file detected, '
+                        f'will skip timestamp: {f_in.name}')
+                    corrupt_dates.add(f_in_date)
+                ds = None
+        if corrupt_dates:
+            for _var in list(self._preprocess_results[self.name_s3].keys()):
+                for _date in corrupt_dates:
+                    self._preprocess_results[self.name_s3][_var].pop(
+                        _date, None)
+            self._log.warning(
+                f'Dropped {len(corrupt_dates)} corrupt S3 timestamp(s): '
+                + str(sorted(d.strftime('%Y%m%dT%H%M%S')
+                             for d in corrupt_dates)))
 
         # Warp S3 HR
         # TODO: Gdalwarp does not keep scaling and offset parameters
@@ -574,8 +986,9 @@ class SenETDownload:
                 f_out = f_in.parent / \
                     str(f_in.name).replace(var_name, var_name_hr)
 
-                self._log.debug(f'Creating HiRes {f_in.name}')
-                type(self).warp_s3_to_S2(f_in, f_out, s2_ref_file, np.nan)
+                if not f_out.exists():
+                    self._log.debug(f'Creating HiRes {f_in.name}')
+                    type(self).warp_s3_to_S2(f_in, f_out, s2_ref_file, np.nan)
 
                 self._preprocess_results[self.name_s3][var_name_hr][
                     f_in_date] = f_out
@@ -593,6 +1006,47 @@ class SenETDownload:
         # Warp dem data
         for var_name, f_in in self._preprocess_results[self.name_dem].items():
             type(self).reference_warp_gdal(f_in, ref_ds=s2_ref_file)
+
+        # Preprocess biopar: copy to preprocess dir, then align to S2 grid.
+        # Files are copied first (like WorldCover) so that:
+        #   - the original download files are never modified, and
+        #   - re-running preprocess is idempotent.
+        for var in type(self).BIOPAR_VARIABLES:
+            key = f'BIOPAR_{var}'
+            if key in self._download_results:
+                biopar_files = self._download_results[key]['output_files']
+                biopar_src_dict = type(self)._create_output_dict_gtiff(
+                    biopar_files)
+                biopar_dst_dir = output_dir / 'BIOPAR' / var
+                biopar_dst_dir.mkdir(parents=True, exist_ok=True)
+                biopar_date_dict = dict()
+                self._log.info(
+                    f'Copying and aligning {var} biopar to S2 reference grid')
+                for f_date, f_src in biopar_src_dict.items():
+                    f_dst = biopar_dst_dir / f_src.name
+                    if not f_dst.exists():
+                        shutil.copy2(f_src, f_dst)
+                    type(self).reference_warp_gdal(f_dst, ref_ds=s2_ref_file)
+                    biopar_date_dict[f_date] = f_dst
+                self._preprocess_results[var] = biopar_date_dict
+
+        # Preprocess WorldCover: warp single GeoTIFF to S2 20m reference grid
+        if self.name_worldcover in self._download_results:
+            wc_files = self._download_results[self.name_worldcover][
+                'output_files']
+            if wc_files:
+                wc_src = wc_files[0]
+                wc_dst = (output_dir / 'WorldCover'
+                          / wc_src.name)
+                wc_dst.parent.mkdir(parents=True, exist_ok=True)
+                if not wc_dst.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(wc_src, wc_dst)
+                self._log.info(
+                    f'Warping WorldCover to S2 reference grid ({wc_dst.name})')
+                type(self).reference_warp_gdal(
+                    wc_dst, ref_ds=s2_ref_file, resampling='mode')
+                self._preprocess_results[self.name_worldcover] = wc_dst
 
         ##################################################################
         # STEP3: Generate quality_flags                                  #
@@ -614,7 +1068,8 @@ class SenETDownload:
         # Remove unnecessary data to save disk space and resources
         # before the sharpening step
         if delete_unrequired_data:
-            s3_required = ('LST', 'inc', 'quality_flag', 'viewZenithAnglesHR')
+            s3_required = ('LST', 'inc', 'quality_flag',
+                           'viewZenithAnglesHR', 'latHR', 'lonHR')
             s2_required = type(self).S2_SHARP_INPUTS
             s2_required.append('NDVI')
             dem_required = ('alt',)
@@ -646,16 +1101,41 @@ class SenETDownload:
         scale = True  # Temporary disable scaling.
         if scale:
             scaling_data = type(self).get_scaling_data()
+            s3_required_for_pipeline = {
+                'LST', 'inc', 'quality_flag',
+                'viewZenithAnglesHR', 'latHR', 'lonHR'
+            }
 
             # Do S3
-            for var_name in self._preprocess_results[self.name_s3].keys():
-                for f_in in self._preprocess_results[self.name_s3][
-                        var_name].values():
+            for var_name in list(self._preprocess_results[self.name_s3].keys()):
+                for f_in_date, f_in in list(
+                        self._preprocess_results[self.name_s3][
+                            var_name].items()):
                     var_scaling_data = scaling_data[self.name_s3].get(
                         var_name, None)
                     if var_scaling_data is not None:
                         self._log.debug(f'Apply S3 Scale/offset {f_in.name}')
-                        type(self).to_scaled_raster(f_in, **var_scaling_data)
+                        try:
+                            type(self).to_scaled_raster(
+                                f_in, **var_scaling_data)
+                        except rasterio.errors.RasterioIOError as ex:
+                            if var_name in s3_required_for_pipeline:
+                                raise RuntimeError(
+                                    f'Corrupt required S3 raster: {f_in}. '
+                                    'Please remove/re-download this scene '
+                                    'and rerun preprocessing.') from ex
+
+                            self._log.warning(
+                                f'Skipping unreadable optional S3 raster '
+                                f'{f_in.name} ({var_name}, '
+                                f'{f_in_date}): {ex}')
+                            try:
+                                if f_in.exists():
+                                    f_in.unlink()
+                            except Exception:
+                                pass
+                            self._preprocess_results[self.name_s3][
+                                var_name].pop(f_in_date, None)
 
             # Do DEM
             for var_name in self._preprocess_results[self.name_dem].keys():
@@ -674,9 +1154,19 @@ class SenETDownload:
         return self._preprocess_results
 
     def sharpening(self, output_dir: Path,
-                   residual_correction: bool = False):
+                   residual_correction: bool = False,
+                   min_valid_fraction: float = 0.0,
+                   mask_to_s3_coverage: bool = False):
 
-        output_dict_pkl = output_dir / self.tile / 'sharpening.pkl'
+        # Build a suffix encoding the filtering/masking parameters so that
+        # runs with different settings produce distinct output files and
+        # pickles and do not collide with each other.
+        _minf_pct = int(round(min_valid_fraction * 100))
+        _file_suffix = f'_minf{_minf_pct:03d}'
+        if mask_to_s3_coverage:
+            _file_suffix += '_msk'
+
+        output_dict_pkl = output_dir / self.tile / f'sharpening{self._temporal_pkl_suffix}{_file_suffix}.pkl'
         output_dir = output_dir / self.tile / '003_sharpening'
         tmp_dir = output_dir / 'tmp'
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -708,14 +1198,85 @@ class SenETDownload:
         # for each s3 date, get closest available s2 observation
         for s3_date in s3_dates:
             output_file = output_dir / \
-                f'LST_SHARPENED_{s3_date.strftime("%Y%m%dT%H%M%S")}.tif'
+                f'LST_SHARPENED_{s3_date.strftime("%Y%m%dT%H%M%S")}{_file_suffix}.tif'
             output_fin = Path(str(output_file).replace('.tif', '_fin.tif'))
+
+            # Stable reference to the original S3 LST — do NOT use lowres_file
+            # for this purpose because it gets overwritten inside the
+            # BlockHelper loop further below.
+            s3_lst_file = s3_data['LST'][s3_date]
+
             if output_fin.is_file():
                 output_files[s3_date] = output_fin
                 self._log.info(f'{s3_date} already processed. ({output_fin})')
+                if mask_to_s3_coverage:
+                    self._log.info(
+                        f'{s3_date}: (Re-)applying S3 coverage mask '
+                        f'to existing file.')
+                    with rasterio.open(s3_lst_file) as _s3:
+                        _s3_arr = _s3.read(1)
+                        _s3_nd = (
+                            _s3.nodata if _s3.nodata is not None else 0)
+                        _s3_valid = (
+                            _s3_arr != _s3_nd).astype(np.uint8)
+                        _s3_tr = _s3.transform
+                        _s3_crs = _s3.crs
+                    with rasterio.open(output_fin) as _fin:
+                        _fin_profile = _fin.profile.copy()
+                        _fin_scales = _fin.scales
+                        _fin_descriptions = _fin.descriptions
+                        _fin_units = _fin.units
+                        _fin_data = _fin.read(1)
+                        _fin_nodata = _fin.nodata
+                        _fin_tr = _fin.transform
+                        _fin_crs = _fin.crs
+                        _fin_h = _fin.height
+                        _fin_w = _fin.width
+                    _s3_valid_hr = np.zeros(
+                        (_fin_h, _fin_w), dtype=np.uint8)
+                    rasterio.warp.reproject(
+                        source=_s3_valid,
+                        destination=_s3_valid_hr,
+                        src_transform=_s3_tr,
+                        src_crs=_s3_crs,
+                        dst_transform=_fin_tr,
+                        dst_crs=_fin_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    _fin_data[_s3_valid_hr == 0] = _fin_nodata
+                    with rasterio.open(
+                            output_fin, 'w', **_fin_profile) as _dst:
+                        _dst.scales = _fin_scales
+                        _dst.descriptions = _fin_descriptions
+                        _dst.units = _fin_units
+                        _dst.write(_fin_data, 1)
+                        _dst.build_overviews(
+                            (4, 8, 16), Resampling.average)
                 continue
 
             # start processing...
+            # Early-exit if the LST raster is entirely nodata / empty
+            # (e.g. fully clouded scene) to avoid wasting time building
+            # the VRT and training the sharpener on zero pixels.
+            # Also skip if the fraction of valid S3 pixels is below the
+            # user-defined minimum threshold (min_valid_fraction).
+            lowres_file = s3_data['LST'][s3_date]
+            with rasterio.open(lowres_file) as _chk:
+                _lst_chk = _chk.read(1)
+                _nd = _chk.nodata if _chk.nodata is not None else 0
+            _valid_frac = np.sum(_lst_chk != _nd) / _lst_chk.size
+            if _valid_frac == 0.0:
+                self._log.warning(
+                    f'{s3_date}: LST raster is entirely nodata — skipping.')
+                continue
+            if _valid_frac < min_valid_fraction:
+                self._log.warning(
+                    f'{s3_date}: LST raster has only '
+                    f'{_valid_frac:.1%} valid pixels '
+                    f'(min_valid_fraction={min_valid_fraction:.1%}) '
+                    f'— skipping.')
+                continue
+
             s2_date_str = find_closest_date(s3_date, s2_dates)
             s2_date = datetime.strptime(s2_date_str, '%Y%m%d')
 
@@ -760,7 +1321,9 @@ class SenETDownload:
                     "movingWindowSize": moving_window_size,
                     "disaggregatingTemperature": True,
                     "baggingRegressorOpt": {
-                        "n_jobs": SenETDownload.NUM_JOBS_DISAGGREGATOR,
+                        "n_jobs": (
+                            1 if sys.gettrace() is not None
+                            else SenETDownload.NUM_JOBS_DISAGGREGATOR),
                         "n_estimators": 30,
                         "max_samples": 0.8,
                         "max_features": 0.8}}
@@ -884,6 +1447,50 @@ class SenETDownload:
                     # use non-corrected file as final output
                     os.rename(output_file, output_fin)
 
+                if mask_to_s3_coverage:
+                    # Mask sharpened LST to only pixels where S3 had valid
+                    # data by reprojecting the S3 valid mask to the output
+                    # high-res grid and applying it.
+                    # Use s3_lst_file (not lowres_file_copy or lowres_file)
+                    # because lowres_file was overwritten in the block loop.
+                    self._log.info(
+                        f'{s3_date}: Masking sharpened LST to S3 coverage.')
+                    with rasterio.open(s3_lst_file) as _s3:
+                        _s3_arr = _s3.read(1)
+                        _s3_nd = (_s3.nodata
+                                  if _s3.nodata is not None else 0)
+                        _s3_valid = (_s3_arr != _s3_nd).astype(np.uint8)
+                        _s3_tr = _s3.transform
+                        _s3_crs = _s3.crs
+                    with rasterio.open(output_fin) as _fin:
+                        _fin_profile = _fin.profile.copy()
+                        _fin_data = _fin.read(1)
+                        _fin_nodata = _fin.nodata
+                        _fin_tr = _fin.transform
+                        _fin_crs = _fin.crs
+                        _fin_h = _fin.height
+                        _fin_w = _fin.width
+                    _s3_valid_hr = np.zeros(
+                        (_fin_h, _fin_w), dtype=np.uint8)
+                    rasterio.warp.reproject(
+                        source=_s3_valid,
+                        destination=_s3_valid_hr,
+                        src_transform=_s3_tr,
+                        src_crs=_s3_crs,
+                        dst_transform=_fin_tr,
+                        dst_crs=_fin_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    _fin_data[_s3_valid_hr == 0] = _fin_nodata
+                    with rasterio.open(
+                            output_fin, 'w', **_fin_profile) as _dst:
+                        _dst.scales = [scaling_data['scale']]
+                        _dst.descriptions = ['LST_SHARPENED_FIN']
+                        _dst.units = ['K']
+                        _dst.write(_fin_data, 1)
+                        _dst.build_overviews(
+                            (4, 8, 16), Resampling.average)
+
                 output_files[s3_date] = output_fin
 
             disaggregator = None
@@ -915,12 +1522,12 @@ class SenETDownload:
             _description_
         """
 
-        lst_dict_pkl = output_dir / self.tile / 'lst_correction.pkl'
+        lst_dict_pkl = output_dir / self.tile / f'lst_correction{self._temporal_pkl_suffix}.pkl'
 
         if corr_parameters is None:
             # No correction required
             self._lst_results = self._sharpening_results.copy()
-            sharpening_pkl = output_dir / self.tile / 'sharpening.pkl'
+            sharpening_pkl = output_dir / self.tile / f'sharpening{self._temporal_pkl_suffix}.pkl'
             shutil.copyfile(sharpening_pkl, lst_dict_pkl)
 
         else:
@@ -972,6 +1579,441 @@ class SenETDownload:
                                          self._lst_results)
 
         return self._lst_results
+
+    def _download_s2_chunked(
+            self,
+            output_dir: Path,
+            chunk_months: int = 1,
+            max_concurrent_jobs: int = 2) -> dict:
+        """Download Sentinel-2 data as monthly temporal chunks via
+        ``openeo.extra.job_management.MultiBackendJobManager``.
+
+        Submits one OpenEO batch job per temporal chunk, tracks them via a
+        persistent CSV job database (resumable if interrupted), then collects
+        all downloaded GeoTIFFs into the standard ``S2/`` directory used by
+        ``preprocess()``.
+
+        Args:
+            output_dir (Path): The ``001_download`` sub-directory.
+            chunk_months (int): Number of months per temporal chunk.
+
+        Returns:
+            dict: Keyed by ``self.name_s2`` with the standard
+            download-result structure
+            ``{'output_path': Path, 'fmt': 'gtiff', 'output_files': [...]``.
+        """
+        try:
+            from openeo.extra.job_management import (
+                MultiBackendJobManager,
+                CsvJobDatabase,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                'openeo.extra.job_management is required for chunked S2 '
+                'download (openeo-python-client >= 0.31.0).'
+            ) from exc
+
+        # ── build temporal chunks ──────────────────────────────────────────
+        start_dt = datetime.strptime(self._temporal_extent[0], '%Y-%m-%d')
+        end_dt   = datetime.strptime(self._temporal_extent[1], '%Y-%m-%d')
+        chunks: List[tuple] = []
+        current = start_dt
+        while current <= end_dt:
+            m         = current.month - 1 + chunk_months
+            next_dt   = datetime(current.year + m // 12, m % 12 + 1, 1)
+            chunk_end = min(next_dt - timedelta(days=1), end_dt)
+            chunks.append((
+                current.strftime('%Y-%m-%d'),
+                chunk_end.strftime('%Y-%m-%d'),
+            ))
+            current = next_dt
+        self._log.info(
+            f'S2 chunked download: {len(chunks)} chunks')
+
+        s2_dir = output_dir / 'S2'
+        s2_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── build jobs DataFrame ───────────────────────────────────────────
+        jobs_df = pd.DataFrame(
+            [{'start_date': cs, 'end_date': ce} for cs, ce in chunks])
+
+        # ── job manager setup ──────────────────────────────────────────────
+        manager_root = output_dir / 'S2' / '_job_manager'
+        manager_root.mkdir(parents=True, exist_ok=True)
+        job_db_path = (
+            output_dir.parent
+            / f's2_jobs{self._temporal_pkl_suffix}.csv'
+        )
+
+        eoconn         = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+        spatial_extent = self._spatial_extent
+        s2_should_mask        = self._s2_should_mask
+        s2_should_composite   = self._s2_should_composite
+        s2_should_interpolate = self._s2_should_interpolate
+        name_s2         = self.name_s2
+        tile            = self.tile
+        job_options     = type(self).JOB_OPTIONS_S2
+        band_names      = type(self).S2_BAND_NAMES
+
+        def start_job(row, connection, **kwargs):
+            chunk_extent = [row['start_date'], row['end_date']]
+            cloud_props = {'eo:cloud_cover': lambda val: val <= 95.0}
+            cube = connection.load_collection(
+                name_s2,
+                temporal_extent=chunk_extent,
+                spatial_extent=spatial_extent,
+                bands=band_names,
+                properties=cloud_props,
+            ).resample_spatial(resolution=20)
+
+            if s2_should_mask:
+                scl_cube = connection.load_collection(
+                    collection_id=name_s2,
+                    bands=['SCL'],
+                    temporal_extent=chunk_extent,
+                    spatial_extent=spatial_extent,
+                    properties=cloud_props,
+                )
+                scl_dilated_mask = scl_cube.process(
+                    'to_scl_dilation_mask',
+                    data=scl_cube,
+                    scl_band_name='SCL',
+                    kernel1_size=17,
+                    kernel2_size=201,
+                    mask1_values=[2, 4, 5, 6, 7],
+                    mask2_values=[3, 8, 9, 10, 11],
+                    erosion_kernel_size=3,
+                ).rename_labels('bands', ['S2-L2A-SCL_DILATED_MASK'])
+                cube = cube.mask(scl_dilated_mask)
+
+            cube = cube.ndvi(nir='B08', red='B04', target_band='NDVI')
+
+            if s2_should_composite:
+                cube = cube.aggregate_temporal_period(
+                    period='dekad', reducer='median')
+
+            if s2_should_interpolate:
+                cube = cube.apply_dimension(
+                    dimension='t',
+                    process='array_interpolate_linear')
+
+            return cube.create_job(
+                out_format='gtiff',
+                title=f'S2_{tile}_{row["start_date"]}_{row["end_date"]}',
+                job_options=job_options,
+            )
+
+        manager = MultiBackendJobManager(
+            root_dir=str(manager_root),
+        )
+        manager.add_backend('cdse', connection=eoconn,
+                            parallel_jobs=max_concurrent_jobs)
+        manager.run_jobs(
+            df=jobs_df,
+            start_job=start_job,
+            job_db=CsvJobDatabase(job_db_path),
+        )
+
+        # ── move downloaded files to S2 dir & report failures ───────────────
+        job_db_df = pd.read_csv(job_db_path)
+        failed = job_db_df[
+            job_db_df['status'].isin(['error', 'cancelled'])]
+        if not failed.empty:
+            self._log.warning(
+                f'S2 chunked: {len(failed)} job(s) failed/cancelled:\n'
+                + failed[['start_date', 'end_date',
+                           'status']].to_string(index=False))
+
+        for _, row in job_db_df[
+                job_db_df['status'] == 'finished'].iterrows():
+            job_dir = manager_root / f"job_{row['id']}"
+            for f in sorted(job_dir.rglob('*.tif')):
+                # Rename openEO_<date>Z.tif → SENTINEL2_L2A_<date>Z.tif
+                dest_name = re.sub(r'^openEO', self.name_s2, f.name)
+                dest = s2_dir / dest_name
+                if not dest.exists():
+                    shutil.move(str(f), str(dest))
+
+        # ── build standard download-result structure ───────────────────────
+        t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        t_end = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+        output_files = type(self).filter_tifs_by_extent(
+            sorted(s2_dir.glob('*.tif')), t_start, t_end)
+        self._log.info(
+            f'S2 chunked: {len(output_files)} file(s) collected in {s2_dir}')
+        return {
+            self.name_s2: {
+                'output_path':  s2_dir,
+                'fmt':          'gtiff',
+                'output_files': output_files,
+            }
+        }
+
+    def _download_biopar_chunked(
+            self,
+            output_dir: Path,
+            chunk_months: int = 1,
+            max_concurrent_jobs: int = 2) -> dict:
+        """Download BIOPAR variables as monthly temporal chunks via
+        ``openeo.extra.job_management.MultiBackendJobManager``.
+
+        Submits one OpenEO batch job per (variable, chunk) combination,
+        tracks them via a persistent CSV job database (resumable if
+        interrupted), then moves the downloaded GeoTIFFs into the standard
+        per-variable subdirectory layout used by ``preprocess()``.
+
+        Args:
+            output_dir (Path): The ``001_download`` sub-directory.
+            chunk_months (int): Number of months per temporal chunk.
+
+        Returns:
+            dict: Keyed by ``'BIOPAR_{var}'`` with the standard
+            download-result structure
+            ``{'output_path': Path, 'fmt': 'gtiff', 'output_files': [...]``.
+        """
+        try:
+            from openeo.extra.job_management import (
+                MultiBackendJobManager,
+                CsvJobDatabase,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                'openeo.extra.job_management is required for chunked BIOPAR '
+                'download (openeo-python-client >= 0.31.0).'
+            ) from exc
+
+        variables = type(self).BIOPAR_VARIABLES
+
+        # ── build temporal chunks ──────────────────────────────────────────
+        start_dt = datetime.strptime(self._temporal_extent[0], '%Y-%m-%d')
+        end_dt   = datetime.strptime(self._temporal_extent[1], '%Y-%m-%d')
+        chunks: List[tuple] = []
+        current = start_dt
+        while current <= end_dt:
+            m         = current.month - 1 + chunk_months
+            next_dt   = datetime(current.year + m // 12, m % 12 + 1, 1)
+            chunk_end = min(next_dt - timedelta(days=1), end_dt)
+            chunks.append((
+                current.strftime('%Y-%m-%d'),
+                chunk_end.strftime('%Y-%m-%d'),
+            ))
+            current = next_dt
+        self._log.info(
+            f'BIOPAR chunked download: {len(variables)} vars \u00d7 '
+            f'{len(chunks)} chunks = {len(variables) * len(chunks)} jobs')
+
+        # ── create per-variable output directories ─────────────────────────
+        for var in variables:
+            (output_dir / 'BIOPAR' / var).mkdir(parents=True, exist_ok=True)
+
+        # ── build jobs DataFrame ───────────────────────────────────────────
+        rows = [
+            {'biopar_var': var, 'start_date': cs, 'end_date': ce}
+            for var in variables
+            for cs, ce in chunks
+        ]
+        jobs_df = pd.DataFrame(rows)
+
+        # ── job manager setup ──────────────────────────────────────────────
+        # Job results are downloaded to manager_root/<job_id>/
+        manager_root = output_dir / 'BIOPAR' / '_job_manager'
+        manager_root.mkdir(parents=True, exist_ok=True)
+        # Job DB CSV lives next to the other pkl files in the tile directory
+        job_db_path = (
+            output_dir.parent
+            / f'biopar_jobs{self._temporal_pkl_suffix}.csv'
+        )
+
+        eoconn = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+        spatial_extent = self._spatial_extent
+        biopar_udp_url = type(self).BIOPAR_UDP_URL
+        job_options    = type(self).JOB_OPTIONS_BIOPAR
+        tile           = self.tile
+
+        def start_job(row, connection, **kwargs):
+            cube = connection.datacube_from_process(
+                process_id='biopar',
+                namespace=biopar_udp_url,
+                spatial_extent=spatial_extent,
+                temporal_extent=[row['start_date'], row['end_date']],
+                biopar_type=row['biopar_var'],
+            )
+            return cube.create_job(
+                out_format='gtiff',
+                title=(
+                    f"biopar_{row['biopar_var']}_{tile}"
+                    f"_{row['start_date']}_{row['end_date']}"
+                ),
+                job_options=job_options,
+            )
+
+        manager = MultiBackendJobManager(
+            root_dir=str(manager_root),
+        )
+        manager.add_backend('cdse', connection=eoconn,
+                            parallel_jobs=max_concurrent_jobs)
+
+        # Retry transient failed/cancelled chunks instead of silently
+        # continuing with partial BIOPAR coverage.
+        pending_df = jobs_df.copy()
+        max_attempts = type(self).BIOPAR_CHUNK_RETRIES + 1
+        attempt = 1
+        while True:
+            self._log.info(
+                f'BIOPAR chunked submission attempt '
+                f'{attempt}/{max_attempts}: {len(pending_df)} job(s)')
+            manager.run_jobs(
+                df=pending_df,
+                start_job=start_job,
+                job_db=CsvJobDatabase(job_db_path),
+            )
+
+            job_db_df = pd.read_csv(job_db_path)
+            failed = job_db_df[
+                job_db_df['status'].isin(['error', 'cancelled'])]
+            if failed.empty:
+                break
+
+            self._log.warning(
+                f'BIOPAR chunked: {len(failed)} job(s) failed/cancelled '
+                f'after attempt {attempt}/{max_attempts}:\n'
+                + failed[['biopar_var', 'start_date',
+                           'end_date', 'status']].to_string(index=False))
+
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    'BIOPAR chunked download exhausted retries with '
+                    f'{len(failed)} failed/cancelled job(s). '
+                    'Please rerun, or inspect backend/job logs.')
+
+            pending_df = failed[
+                ['biopar_var', 'start_date', 'end_date']
+            ].drop_duplicates().reset_index(drop=True)
+            attempt += 1
+            self._log.info(
+                f'Retrying failed BIOPAR chunks in '
+                f'{type(self).RETRY_DELAY} seconds...')
+            time.sleep(type(self).RETRY_DELAY)
+
+        # ── move downloaded files to per-variable dirs ─────────────────────
+        job_db_df = pd.read_csv(job_db_path)
+
+        for _, row in job_db_df[
+                job_db_df['status'] == 'finished'].iterrows():
+            job_dir = manager_root / f"job_{row['id']}"
+            var_dir = output_dir / 'BIOPAR' / row['biopar_var']
+            bname = f"BIOPAR_{row['biopar_var']}"
+            for f in sorted(job_dir.rglob('*.tif')):
+                # Rename openEO_<date>Z.tif → BIOPAR_<VAR>_<date>Z.tif
+                dest_name = re.sub(r'^openEO', bname, f.name)
+                dest = var_dir / dest_name
+                if not dest.exists():
+                    shutil.move(str(f), str(dest))
+
+        # ── build standard download-result structure ───────────────────────
+        b_t_start = datetime.strptime(
+            str(self._temporal_extent[0])[:10], '%Y-%m-%d')
+        b_t_end = datetime.strptime(
+            str(self._temporal_extent[1])[:10], '%Y-%m-%d')
+        results: dict = {}
+        for var in variables:
+            var_dir      = output_dir / 'BIOPAR' / var
+            output_files = type(self).filter_tifs_by_extent(
+                sorted(var_dir.glob('*.tif')), b_t_start, b_t_end)
+            results[f'BIOPAR_{var}'] = {
+                'output_path': var_dir,
+                'fmt':         'gtiff',
+                'output_files': output_files,
+            }
+            self._log.info(
+                f'BIOPAR {var}: {len(output_files)} file(s) collected')
+        return results
+
+    def compute_biopar(self,
+                       output_dir: Path,
+                       variables: List[str] = None) -> dict:
+        """Compute biophysical variables (LAI, FAPAR, FCOVER) using the
+        ESA-APEx biopar UDP on CDSE OpenEO. One OpenEO job is launched
+        per variable since the UDP only computes one variable at a time.
+
+        Args:
+            output_dir (Path): Root output directory.
+            variables (List[str], optional): List of variables to compute.
+                Defaults to BIOPAR_VARIABLES = ["LAI", "FAPAR", "FCOVER"].
+
+        Returns:
+            dict: {
+                "LAI":   {<datetime>: <Path>, ...},
+                "FAPAR": {<datetime>: <Path>, ...},
+                "FCOVER":{<datetime>: <Path>, ...}
+            }
+        """
+        if variables is None:
+            variables = type(self).BIOPAR_VARIABLES
+
+        biopar_pkl = output_dir / self.tile / f'biopar{self._temporal_pkl_suffix}.pkl'
+        biopar_dir = output_dir / self.tile / '005_biopar'
+        biopar_dir.mkdir(parents=True, exist_ok=True)
+
+        if biopar_pkl.is_file():
+            self._log.info('Biopar already computed. Loading results.')
+            self._biopar_results = self._check_and_load_pickled_dict(
+                biopar_pkl, biopar_dir)
+            return self._biopar_results
+
+        self._biopar_results = self._get_initial_output_dict()
+
+        eoconn = openeo.connect(
+            type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        # Run one OpenEO job per variable
+        for biopar_var in variables:
+            var_dir = biopar_dir / biopar_var
+            var_dir.mkdir(parents=True, exist_ok=True)
+
+            self._log.info(f'Computing biopar variable: {biopar_var}')
+
+            # The biopar UDP handles S2 loading (B03, B04, B08 + angle bands),
+            # band selection, and SCL cloud masking internally.
+            # Pass spatial_extent, temporal_extent, and biopar_type as
+            # top-level parameters — do NOT pass a pre-built data cube.
+            biopar_cube = eoconn.datacube_from_process(
+                process_id="biopar",
+                namespace=type(self).BIOPAR_UDP_URL,
+                spatial_extent=self._spatial_extent,
+                temporal_extent=self._temporal_extent,
+                biopar_type=biopar_var
+            )
+
+            batch_job: BatchJob = self._execute_datacube(
+                biopar_cube,
+                output_format='gtiff',
+                name=f'biopar_{biopar_var}_{self.tile}',
+                job_options=type(self).JOB_OPTIONS_BIOPAR
+            )
+
+            output_files = self._download_job_result(
+                batch_job,
+                var_dir,
+                output_format='gtiff',
+                name=biopar_var
+            )
+
+            self._biopar_results[biopar_var] = \
+                type(self)._create_output_dict_gtiff(output_files)
+
+            self._log.info(
+                f'Biopar {biopar_var}: '
+                f'{len(self._biopar_results[biopar_var])} files downloaded')
+
+        type(self).pickle_write_dict(biopar_pkl,
+                                     biopar_dir, self._biopar_results)
+
+        return self._biopar_results
 
     def _get_initial_output_dict(self) -> dict:
         """
@@ -1035,7 +2077,7 @@ class SenETDownload:
                 if spatial_extent_loaded == self._spatial_extent and \
                    temporal_extent_loaded == temporal_extent_dt:
                     self._log.info(
-                        'Data already downloaded; '
+                        'Data already present; '
                         'returning results from data.pkl')
                     return dict_in
                 else:
@@ -1198,13 +2240,13 @@ class SenETDownload:
                 spatial_extent=self._spatial_extent,
                 properties=cube_properties)
 
-            # Compute the SCL dilation mask
+            # Compute the SCL dilation mask the same settings as the BIOPAR UDP to be consistent with the biopar variable computation are applied to the S2 bands. 
             scl_dilated_mask = scl_cube.process(
                 "to_scl_dilation_mask",
                 data=scl_cube,
                 scl_band_name="SCL",
-                kernel1_size=9,
-                kernel2_size=39,
+                kernel1_size=17,
+                kernel2_size=201,
                 mask1_values=[2, 4, 5, 6, 7],
                 mask2_values=[3, 8, 9, 10, 11],
                 erosion_kernel_size=3,
@@ -1235,13 +2277,22 @@ class SenETDownload:
             eoconn = openeo.connect(
                 type(self).OPENEO_CDSE_URL).authenticate_oidc()
 
-        s3_band = eoconn.load_collection(
+        s3_band1 = eoconn.load_collection(
             self.name_s3,
             temporal_extent=self._temporal_extent,
             spatial_extent=self._spatial_extent,
-            bands=type(self).S3_BAND_NAMES
+            bands=type(self).S3_BAND_NAMES1
+        )
+        
+        s3_band2 = eoconn.load_collection(
+            self.name_s3,
+            temporal_extent=self._temporal_extent,
+            spatial_extent=self._spatial_extent,
+            bands=type(self).S3_BAND_NAMES2
         )
 
+        s3_band =s3_band1.merge_cubes(s3_band2)
+        
         # Further filter the S3 datacube:
         if self._s3_should_filter:
             # 1. Filter only daytime observations
@@ -1280,6 +2331,59 @@ class SenETDownload:
         )
         dem_band = dem_band.max_time()
         return dem_band
+
+    def _get_datacube_worldcover(self,
+                                 eoconn: Optional[Connection] = None
+                                 ) -> DataCube:
+        """Load the ESA WorldCover land-cover product from OpenEO.
+
+        The collection is chosen automatically based on the temporal extent:
+        - start year < 2021  → ``ESA_WORLDCOVER_10M_2020_V1``
+        - start year ≥ 2021  → ``ESA_WORLDCOVER_10M_2021_V2``
+        """
+        if eoconn is None:
+            eoconn = openeo.connect(
+                type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        wc_band = eoconn.load_collection(
+            self.name_worldcover,
+            temporal_extent=["2000-01-01", "2030-12-31"],
+            spatial_extent=self._spatial_extent,
+            bands=["MAP"],
+        )
+        wc_band = wc_band.max_time()
+        return wc_band
+
+    def _get_datacube_biopar(self, biopar_var: str,
+                             eoconn: Optional[Connection] = None) -> DataCube:
+        if eoconn is None:
+            eoconn = openeo.connect(
+                type(self).OPENEO_CDSE_URL).authenticate_oidc()
+
+        # The biopar UDP handles S2 loading (B03, B04, B08 + angle bands),
+        # band selection, and SCL cloud masking internally.
+        # Pass spatial_extent, temporal_extent, and biopar_type as
+        # top-level parameters — do NOT pass a pre-built data cube.
+        biopar_cube = eoconn.datacube_from_process(
+            process_id="biopar",
+            namespace=type(self).BIOPAR_UDP_URL,
+            spatial_extent=self._spatial_extent,
+            temporal_extent=self._temporal_extent,
+            biopar_type=biopar_var
+        )
+
+        # Dekadal compositing (same as S2/NDVI)
+        if self._s2_should_composite:
+            biopar_cube = biopar_cube.aggregate_temporal_period(
+                period='dekad', reducer='median')
+
+        # Linear temporal interpolation to fill gaps (same as S2/NDVI)
+        if self._s2_should_interpolate:
+            biopar_cube = biopar_cube.apply_dimension(
+                dimension="t", process="array_interpolate_linear"
+            )
+
+        return biopar_cube
 
     def _calculate_incidence_angle(self, input_dict: dict) -> dict:
         tmp_dict = input_dict.copy()
@@ -1372,6 +2476,68 @@ class SenETDownload:
         return quality_flag_dict
 
     @staticmethod
+    def filter_tifs_by_extent(
+            tif_list,
+            t_start: datetime,
+            t_end: datetime) -> list:
+        """Return only those paths whose filename-embedded date falls within
+        ``[t_start, t_end]``.  Files with no recognisable date are kept."""
+        _pat = re.compile(
+            r'.*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z?\.tif', re.I)
+        filtered = []
+        for f in tif_list:
+            m = _pat.match(Path(f).name)
+            if m:
+                fdate = datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if t_start <= fdate <= t_end:
+                    filtered.append(f)
+            else:
+                filtered.append(f)  # no date in name → keep
+        return filtered
+
+    @staticmethod
+    def _find_covering_s3_netcdfs(
+            nc_dir: Path,
+            t_start: datetime,
+            t_end: datetime) -> List[Path]:
+        """Return a sorted list of ``datacube_s3_*.nc`` files in *nc_dir*
+        whose combined temporal coverage spans ``[t_start, t_end]``
+        without internal gaps.
+
+        Filenames are expected to encode their temporal range as
+        ``datacube_s3_YYYYMMDD_YYYYMMDD.nc`` (the format produced by
+        :attr:`_temporal_pkl_suffix`).  Files that do not match this pattern
+        are silently ignored.
+
+        Returns an empty list when the existing files do not fully cover the
+        requested extent or when no matching files are found.
+        """
+        pat = re.compile(r'datacube_s3_(\d{8})_(\d{8})\.nc')
+        candidates: List[tuple] = []
+        for f in sorted(nc_dir.glob('datacube_s3_*.nc')):
+            m = pat.match(f.name)
+            if m:
+                fs = datetime.strptime(m.group(1), '%Y%m%d')
+                fe = datetime.strptime(m.group(2), '%Y%m%d')
+                candidates.append((fs, fe, f))
+        if not candidates:
+            return []
+        # Sort by start date and verify contiguous coverage of [t_start, t_end]
+        candidates.sort(key=lambda x: x[0])
+        if candidates[0][0] > t_start:
+            return []  # earliest file starts after the requested start
+        covered_up_to = candidates[0][1]
+        for fs, fe, _ in candidates[1:]:
+            if fs > covered_up_to + timedelta(days=1):
+                return []  # gap detected between consecutive files
+            covered_up_to = max(covered_up_to, fe)
+        if covered_up_to < t_end:
+            return []  # files do not reach the requested end date
+        # Return only files that overlap the requested range
+        return [f for fs, fe, f in candidates if fe >= t_start and fs <= t_end]
+
+    @staticmethod
     def _convert_spatial_extent(
             spatial_extent: Union[Path,
                                   Dict[str, float],
@@ -1426,7 +2592,10 @@ class SenETDownload:
     def _create_output_dict_gtiff(
             filelist: List[Path]) -> Dict[datetime, Path]:
 
-        pattern = r".*_(\d{4})-(\d{2})-(\d{2})Z\.tif"
+        # Matches both:
+        # - openEO date format: SENTINEL2_L2A_2022-01-01Z.tif (dashes, no time)
+        # - legacy format: something_20220101T000000Z.tif (no dashes, with time)
+        pattern = r".*_(\d{4})-?(\d{2})-?(\d{2})(?:T[^Z]*)?Z\.tif"
         output_dict = dict()
         for f in filelist:
             match = re.match(pattern, f.name)
@@ -1476,7 +2645,7 @@ class SenETDownload:
                 offsets = f_in_handler.offsets
 
                 for i in range(0, bands):
-                    desc = f_in_handler.tags(i + 1).get('DESCRIPTION')
+                    desc = f_in_handler.descriptions[i]
                     scale = scales[i]
                     offset = offsets[i]
                     data = f_in_handler.read(i + 1)
@@ -1525,7 +2694,8 @@ class SenETDownload:
             confidence_bitlayers = f.parent / \
                 f"confidence_in_bitlayers_{date_str}.tif"
 
-            SenETDownload.convert_s3_confidence_in(f, confidence_bitlayers)
+            if not confidence_bitlayers.exists():
+                SenETDownload.convert_s3_confidence_in(f, confidence_bitlayers)
 
             gtiff_dict['confidence_in_bitlayers'][dt] = confidence_bitlayers
 
@@ -1628,18 +2798,19 @@ class SenETDownload:
             output_dict[name] = dict()
             if 't' in data_array.dims:
                 for t in xar_in['t'].values:
-                    data = data_array.sel(t=t)
-                    if data.dtype == 'float64' and force_f32:
-                        data = data.astype('float32')
                     t = pd.Timestamp(t)
                     str_date = t.strftime('%Y%m%dT%H%M%SZ')
                     output_file = output_dir / f"{name}-{str_date}.tif"
-                    data.rio.write_crs(epsg, inplace=True)
-                    data.rio.to_raster(output_file, compress='deflate')
-
                     dt = datetime(t.year, t.month, t.day, t.hour,
                                   t.minute, t.second, t.microsecond)
                     output_dict[name][dt] = output_file
+                    if output_file.exists():
+                        continue  # already converted in a prior run
+                    data = data_array.sel(t=t)
+                    if data.dtype == 'float64' and force_f32:
+                        data = data.astype('float32')
+                    data.rio.write_crs(epsg, inplace=True)
+                    data.rio.to_raster(output_file, compress='deflate')
 
         # Write dimension grid
         if write_dims:
@@ -1664,14 +2835,16 @@ class SenETDownload:
                 output_file_x = output_dir / f"{name_x}-{str_date}.tif"
                 output_file_y = output_dir / f"{name_y}-{str_date}.tif"
 
-                shutil.copyfile(tmp_x, output_file_x)
-                shutil.copyfile(tmp_y, output_file_y)
-
                 dt = datetime(t.year, t.month, t.day, t.hour,
                               t.minute, t.second, t.microsecond)
 
                 output_dict[name_x][dt] = output_file_x
                 output_dict[name_y][dt] = output_file_y
+
+                if output_file_x.exists() and output_file_y.exists():
+                    continue  # already written in a prior run
+                shutil.copyfile(tmp_x, output_file_x)
+                shutil.copyfile(tmp_y, output_file_y)
 
             tmp_x.unlink()
             tmp_y.unlink()
@@ -1829,11 +3002,21 @@ class SenETDownload:
         else:
             tmp_dst_ds = src_ds.parent / f'tmp_{src_ds.name}'
 
-        with rasterio.open(ref_ds, 'r') as ref:
-            ref_transform = ref.transform
-            # ref_res = ref_transform[0]
-            ref_crs = ref.crs
-            ref_bounds = ref.bounds
+        ref_ds = Path(ref_ds)
+        if not ref_ds.exists():
+            raise FileNotFoundError(
+                f'Reference dataset does not exist: {ref_ds}')
+
+        try:
+            with rasterio.open(ref_ds, 'r') as ref:
+                ref_transform = ref.transform
+                # ref_res = ref_transform[0]
+                ref_crs = ref.crs
+                ref_bounds = ref.bounds
+        except rasterio.errors.RasterioIOError as ex:
+            raise RuntimeError(
+                f'Reference dataset is unreadable or not in a supported '
+                f'format: {ref_ds}. Original error: {ex}') from ex
 
         dst_output_bounds = (ref_bounds.left, ref_bounds.bottom,
                              ref_bounds.right, ref_bounds.top)
@@ -1849,7 +3032,7 @@ class SenETDownload:
         else:
             raise ValueError(f'{res} not recognised')
 
-        dst_srs = ref_crs['init']
+        dst_srs = ref_crs.to_wkt()  #adjusted to properly set the SRS in the output file was dst_srs = ref_crs['init']
 
         creation_opts = ('COMPRESS=DEFLATE', 'TILED=YES',
                          'BLOCKXSIZE=256', 'BLOCKYSIZE=256')
@@ -1921,16 +3104,31 @@ class SenETDownload:
                 SenETDownload.set_relative_paths_dict(relative_root, value)
 
             elif isinstance(value, Path):
-                input_dictionary[key] = value.relative_to(relative_root)
+                input_dictionary[key] = Path(
+                    os.path.relpath(value, relative_root))
 
             elif isinstance(value, list):
                 if all(isinstance(item, Path) for item in value):
                     for i in range(0, len(value)):
-                        value[i] = value[i].relative_to(relative_root)
+                        value[i] = Path(
+                            os.path.relpath(value[i], relative_root))
 
             else:
                 pass
                 # Skip
+
+    @staticmethod
+    def _iter_paths(d: dict):
+        """Recursively yield all Path values stored in a (nested) dict."""
+        for v in d.values():
+            if isinstance(v, Path):
+                yield v
+            elif isinstance(v, dict):
+                yield from SenETDownload._iter_paths(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Path):
+                        yield item
 
     @staticmethod
     def set_absolute_paths_dict(relative_root: Path, input_dictionary: dict):
@@ -1939,12 +3137,12 @@ class SenETDownload:
                 SenETDownload.set_absolute_paths_dict(relative_root, value)
 
             elif isinstance(value, Path):
-                input_dictionary[key] = relative_root / value
+                input_dictionary[key] = (relative_root / value).resolve()
 
             elif isinstance(value, list):
                 if all(isinstance(item, Path) for item in value):
                     for i in range(0, len(value)):
-                        value[i] = relative_root / value[i]
+                        value[i] = (relative_root / value[i]).resolve()
 
             else:
                 pass

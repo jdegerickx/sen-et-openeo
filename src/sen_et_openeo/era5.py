@@ -20,16 +20,34 @@ from sen_et_openeo.utils.meteo import (comp_air_temp_inputs,
 from sen_et_openeo.ts import TimeSeriesProcessor
 
 ERA5_BANDS_DICT = {25000: ['t2m', 'z', 'd2m', 'sp',
-                           #    'v100', 'u100', 'ssrdc', 'ssrd'
+                           'v100', 'u100', 'ssrdc', 'ssrd'
                            ]}
 ERA5_BANDS_DICT_DOWNLOAD = ["2m_temperature", "z",
                             "2m_dewpoint_temperature",
                             "surface_pressure",
-                            # "100m_v_component_of_wind",
-                            # "100m_u_component_of_wind",
-                            # "surface_solar_radiation_downward_clear_sky",
-                            # "surface_solar_radiation_downwards"
+                            "100m_v_component_of_wind",
+                            "100m_u_component_of_wind",
+                            "surface_solar_radiation_downward_clear_sky",
+                            "surface_solar_radiation_downwards"
                             ]
+
+
+def comp_wind_speed(u100, v100):
+    """Compute wind speed (m/s) from 100m u and v wind components."""
+    return np.sqrt(u100**2 + v100**2)
+
+
+def comp_vapour_pressure(d2m):
+    """Compute vapour pressure (mb/hPa) from 2m dewpoint temperature (K).
+    Uses the Magnus formula.
+    """
+    Td_C = d2m - 273.15
+    return 6.1078 * np.exp(17.269 * Td_C / (235.5 + Td_C))
+
+
+def comp_air_pressure_mb(sp):
+    """Convert surface pressure from Pa to mb."""
+    return sp / 100.0
 
 
 def get_default_rsi_meta():
@@ -39,7 +57,19 @@ def get_default_rsi_meta():
                 "air_temperature": {
                     'bands': ['t2m', 'd2m', 'z', 'sp'],
                     'native_res': 25000,
-                    'func': comp_air_temp}
+                    'func': comp_air_temp},
+                "vapour_pressure": {
+                    'bands': ['d2m'],
+                    'native_res': 25000,
+                    'func': comp_vapour_pressure},
+                "air_pressure": {
+                    'bands': ['sp'],
+                    'native_res': 25000,
+                    'func': comp_air_pressure_mb},
+                "wind_speed": {
+                    'bands': ['u100', 'v100'],
+                    'native_res': 25000,
+                    'func': comp_wind_speed},
             }
     }
 
@@ -277,6 +307,7 @@ class ERA5TimeSeriesProcessor(TimeSeriesProcessor):
 
             # stack all bands
             timeseries.append(np.stack(data, axis=0))
+            ncfile.close()
 
         # stack all data to build timeseries object
         valid = [self.timestamps[i] for i, v in enumerate(timeseries)
