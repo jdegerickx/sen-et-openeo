@@ -461,29 +461,6 @@ def main(
             continue
         compute_lst_ta(lst_file, t, elev_file, time_zone, era5col, outfile)
 
-    # create pandas dataframe with needed information
-    filenames = [Path(f).name for f in outfiles]
-    startTimes = [pd.to_datetime(f.split("_")[1]) for f in filenames]
-    startTimes = [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in startTimes]
-    descriptions = ["Land Surface Temperature - air temperature (K)"] * len(filenames)
-    geometries = [""] * len(filenames)
-    df = pd.DataFrame(
-        {
-            "geometry": geometries,
-            "startTime": startTimes,
-            "endTime": startTimes,
-            "filename": filenames,
-            "description": descriptions,
-        }
-    )
-
-    # save as ; separate csv file
-    outcsv = output_dir / tile / f"FSTEP_upload_lst-ta_{tile}.csv"
-    df.to_csv(outcsv, sep=";", index=False)
-
-    print(f"** Results saved in: {outdir}")
-    print(f"** CSV file for FSTEP upload saved in: {outcsv}")
-
     # Get NDVI data separately
     logger.info("** Getting NDVI data")
     ndvi_files = list(preprocess_dict["SENTINEL2_L2A"]["NDVI"].values())
@@ -498,32 +475,6 @@ def main(
             continue
         shutil.copyfile(f, dest)
 
-    # create pandas dataframe with needed information
-    filenames = [Path(f).name for f in outfiles]
-    startTimes = [pd.to_datetime(f.split("_")[1]) for f in filenames]
-    endTimes = [st + pd.Timedelta("1D") for st in startTimes]
-    startTimes = [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in startTimes]
-    endTimes = [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in endTimes]
-
-    descriptions = ["Normalized difference vegetation index"] * len(filenames)
-    geometries = [""] * len(filenames)
-    df = pd.DataFrame(
-        {
-            "geometry": geometries,
-            "startTime": startTimes,
-            "endTime": endTimes,
-            "filename": filenames,
-            "description": descriptions,
-        }
-    )
-
-    # save as ; separate csv file
-    outcsv = output_dir / tile / f"FSTEP_upload_NDVI_{tile}.csv"
-    df.to_csv(outcsv, sep=";", index=False)
-
-    print(f"** Results saved in: {outdir}")
-    print(f"** CSV file for FSTEP upload saved in: {outcsv}")
-    
     if compute_et_tseb:
         logger.info("** Computing ET with TSEB-PT model")
         biopar_dict = {var: preprocess_dict[var] for var in SenETDownload.BIOPAR_VARIABLES}

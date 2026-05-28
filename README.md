@@ -10,8 +10,7 @@ The script now runs a complete multi-step processing chain: OpenEO/CDSE download
 In addition to the LST sharpening as developed within Sen4ET, additional bias and directionality corrections based on intercomparison of sharpened Sentinel-3 LST data with ECOSTRESS LST data have been added.
 All scripts required to compute these correction coefficients can be found in the `scripts/corrections_ecostress/` folder.
 
-At the end of the main script, all required files are prepared to upload the final results to the Food Security TEP platform.
-Actual data upload is completely optional and can be done using the scripts located under `scripts/FSTEP_upload` script.
+After data production completes, GeoTIFFs can be prepared for upload to the Food Security TEP platform using a separate utility script (`scripts/FSTEP_upload/prepare_fstep.py`). Data upload itself is completely optional and can be performed using scripts located under `scripts/FSTEP_upload/`.
 
 ---
 
@@ -258,13 +257,12 @@ LST-Ta = LST_sharpened - T_air_ERA5
 ```
 
 Output GeoTIFFs are written to `005_lst-ta/` as scaled `int16` (scale = 0.01 K).
-A CSV file ready for Food Security TEP upload is also generated.
 
 ---
 
 ### Step 5 — NDVI export (`006_ndvi/`)
 
-NDVI composites from the preprocessing step are copied to `006_ndvi/` with a standardised naming convention, and a CSV file for TEP upload is generated.
+NDVI composites from the preprocessing step are copied to `006_ndvi/` with a standardised naming convention.
 
 ---
 
