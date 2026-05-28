@@ -523,17 +523,18 @@ def main(
 
     print(f"** Results saved in: {outdir}")
     print(f"** CSV file for FSTEP upload saved in: {outcsv}")
-
-    logger.info("** Computing ET with TSEB-PT model")
-    biopar_dict = {var: preprocess_dict[var] for var in SenETDownload.BIOPAR_VARIABLES}
-    worldcover_file = preprocess_dict[data_download.name_worldcover]
-    s3_dict = preprocess_dict["SENTINEL3_SLSTR_L2_LST"]
-    outdir_et = output_dir / tile / "007_et"
-    outdir_meteo = outdir_et / "meteo"
-    outdir_meteo.mkdir(parents=True, exist_ok=True)
-
-    meteo_cache = {}
+    
     if compute_et_tseb:
+        logger.info("** Computing ET with TSEB-PT model")
+        biopar_dict = {var: preprocess_dict[var] for var in SenETDownload.BIOPAR_VARIABLES}
+        worldcover_file = preprocess_dict[data_download.name_worldcover]
+        s3_dict = preprocess_dict["SENTINEL3_SLSTR_L2_LST"]
+        outdir_et = output_dir / tile / "007_et"
+        outdir_meteo = outdir_et / "meteo"
+        outdir_meteo.mkdir(parents=True, exist_ok=True)
+
+        meteo_cache = {}
+    
         outdir_et.mkdir(parents=True, exist_ok=True)
         outdir_meteo.mkdir(parents=True, exist_ok=True)
 
@@ -678,12 +679,13 @@ def main(
         if inp30_path.exists():
             logger.info("Cleaning up LSTM-like intermediate files...")
             shutil.rmtree(inp30_path)
-
-    # Clean up meteo intermediate GeoTIFFs — done here (not inside compute_et)
-    # so that LSTM-like resampling can still read them if generate_lstm_like=True
-    if outdir_meteo.exists():
-        logger.info("Cleaning up meteo intermediate files...")
-        shutil.rmtree(outdir_meteo)
+    
+    if compute_et_tseb:
+        # Clean up meteo intermediate GeoTIFFs — done here (not inside compute_et)
+        # so that LSTM-like resampling can still read them if generate_lstm_like=True
+        if outdir_meteo.exists():
+            logger.info("Cleaning up meteo intermediate files...")
+            shutil.rmtree(outdir_meteo)
 
     logger.info("** All done!")
 
