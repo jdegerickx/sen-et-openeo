@@ -26,7 +26,6 @@ import matplotlib.pyplot as plt
 
 from sen_et_openeo.era5 import ERA5TimeSeriesProcessor, get_default_rsi_meta
 from sen_et_openeo.utils.geoloader import _getECMWFIntegratedData
-from sen_et_openeo.utils.meteo import calc_lapse_rate_moist, Z_BH, GRAVITY
 from sen_et_openeo.utils.warping import warp_in_memory
 
 
@@ -271,19 +270,24 @@ def compute_meteo_for_tseb(time, elev_file, time_zone, era5col, outdir):
         elev_data = src.read(1).astype(np.float32)
     ref_profile.update(count=1, dtype=rasterio.float32, nodata=-9999.0)
 
-    # Load ERA5 bands temporally interpolated to overpass time
-    # and resampled to the 20m S2 grid.
-    # Note: ssrd (solar radiation) is an accumulated field — the
-    # ERA5TimeSeriesProcessor reads it as a 24h daily integral via
-    # _getECMWFIntegratedData, giving a daily mean in W/m².
+    # Delegate all ERA5 band loading and meteorological derivations to
+    # ERA5TimeSeriesProcessor via the RSI path defined in era5.py.
+    # This avoids re-implementing formulas already tested there and uses the
+    # physically correct two-step lapse-rate correction for T_A1:
+    #   step 1 (comp_air_temp_inputs): t2m → T_datum at 0 m datum
+    #   step 2 (comp_air_temp):        T_datum → T_A1 at DEM elev + 100 m BH
+    # elev_data is passed so comp_air_temp can apply the terrain correction.
+    # ssrd is kept as a plain band: the processor reads it as the 24 h daily
+    # integral via _getECMWFIntegratedData, giving a daily mean in W/m².
     meteo_settings = {
-        'bands': ['t2m', 'z', 'd2m', 'sp', 'u100', 'v100', 'ssrd']
+        'rsis':  ['air_temperature', 'vapour_pressure', 'air_pressure', 'wind_speed'],
+        'bands': ['ssrd'],
     }
     meteo_rsi_meta = get_default_rsi_meta().get('ERA5')
 
     meteo_ts = ERA5TimeSeriesProcessor(
         [time],
-        None,
+        elev_data,   # required by comp_air_temp for blending-height correction
         elev_file,
         time_zone,
         era5col,
@@ -295,27 +299,11 @@ def compute_meteo_for_tseb(time, elev_file, time_zone, era5col, outdir):
         idx = meteo_ts.bands.index(name)
         return np.squeeze(meteo_ts.data[idx, 0, ...]).astype(np.float32)
 
-    t2m      = get_band('t2m')   # K  — 2m air temperature
-    z_geopot = get_band('z')     # m²/s² — geopotential
-    d2m      = get_band('d2m')   # K  — 2m dewpoint temperature
-    sp       = get_band('sp')    # Pa — surface pressure
-    u100     = get_band('u100')  # m/s — u-component of wind at 100m
-    v100     = get_band('v100')  # m/s — v-component of wind at 100m
-    ssrd_24h = get_band('ssrd')  # W/m² — daily mean solar radiation
-
-    # --- Derived meteorological quantities ---
-    z_m  = z_geopot / GRAVITY   # geopotential → geometric height (m)
-    # Vapour pressure from dewpoint via Magnus formula (mb)
-    ea   = 6.1078 * np.exp(17.269 * (d2m - 273.15) / (235.5 + (d2m - 273.15)))
-    p_mb = sp / 100.0            # Pa → mb
-    ws   = np.sqrt(u100**2 + v100**2)  # scalar wind speed (m/s)
-
-    # Air temperature at 100m blending height above surface:
-    # 1. Extrapolate from 2m to 0m datum using geopotential height as ref.
-    # 2. Re-apply lapse rate from 0m datum up to (DEM elev + 100m).
-    lapse   = calc_lapse_rate_moist(t2m, ea, p_mb)
-    t_datum = t2m - lapse * (0.0 - (z_m + 2.0))   # T at 0m datum
-    t_a     = t_datum - lapse * (elev_data + Z_BH)  # T at blending height
+    t_a      = get_band('air_temperature')  # K   — T at 100 m blending height
+    ea       = get_band('vapour_pressure')  # mb  — vapour pressure
+    p_mb     = get_band('air_pressure')     # mb  — air pressure
+    ws       = get_band('wind_speed')       # m/s — scalar wind speed
+    ssrd_24h = get_band('ssrd')             # W/m² — daily mean solar radiation
 
     def write_tif(data, suffix):
         path = outdir / f'{suffix}.tif'
@@ -346,12 +334,10 @@ def compute_meteo_for_tseb(time, elev_file, time_zone, era5col, outdir):
     paths['S_dn'] = write_tif(s_dn, f'{timestr}_SW-IN')
 
     # Free all large full-tile arrays before the TSEB block loop.
-    # Each float32 array is ~120 MB for a 5490x5490 S2 tile;
-    # meteo_ts holds a 7-band stack (~840 MB).
+    # Each float32 array is ~120 MB for a 5490x5490 S2 tile.
     del (meteo_ts,
-         t2m, z_geopot, d2m, sp, u100, v100, ssrd_24h,
-         z_m, ea, p_mb, ws, lapse, t_datum, t_a, elev_data,
-         s_dn_raw, s_dn)
+         t_a, ea, p_mb, ws, ssrd_24h,
+         elev_data, s_dn_raw, s_dn)
     gc.collect()
 
     return paths
