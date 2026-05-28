@@ -1,5 +1,8 @@
 import os
 import glob
+import re
+import zipfile
+from collections import defaultdict
 from loguru import logger
 import pandas as pd
 from pathlib import Path
@@ -7,6 +10,7 @@ import numpy as np
 import netCDF4
 import datetime
 import copy
+from osgeo import gdal
 
 from sen_et_openeo.utils.timeseries import Timeseries
 from sen_et_openeo.utils.collections import DiskCollection
@@ -20,16 +24,156 @@ from sen_et_openeo.utils.meteo import (comp_air_temp_inputs,
 from sen_et_openeo.ts import TimeSeriesProcessor
 
 ERA5_BANDS_DICT = {25000: ['t2m', 'z', 'd2m', 'sp',
-                           'v100', 'u100', 'ssrdc', 'ssrd'
+                           'v100', 'u100', 'ssrd'
                            ]}
-ERA5_BANDS_DICT_DOWNLOAD = ["2m_temperature", "z",
+ERA5_BANDS_DICT_DOWNLOAD = ["2m_temperature",
+                            "geopotential",
                             "2m_dewpoint_temperature",
                             "surface_pressure",
                             "100m_v_component_of_wind",
                             "100m_u_component_of_wind",
-                            "surface_solar_radiation_downward_clear_sky",
                             "surface_solar_radiation_downwards"
                             ]
+
+# Mapping from GRIB_ELEMENT values (WMO codes, case-insensitive) to internal
+# ERA5 variable names used throughout this codebase.
+# Variables whose GRIB_ELEMENT already matches the internal name (Z, SP, SSRD)
+# are not listed here.
+_GRIB_ELEMENT_TO_INTERNAL = {
+    '2t':   't2m',
+    '2d':   'd2m',
+    'var246 of table 228 of center ecmwf': 'u100',
+    'var247 of table 228 of center ecmwf': 'v100',
+}
+
+
+
+def _get_grib_element(band_meta: dict) -> str:
+    """Return the GRIB_ELEMENT (WMO code) from a GDAL GRIB band metadata dict.
+    
+    Only uses GRIB_ELEMENT for identification; GRIB_SHORT_NAME is considered
+    unreliable and is not consulted.
+    """
+    return str(band_meta.get('GRIB_ELEMENT', ''))
+
+
+def _parse_valid_time_epoch(meta: dict) -> int:
+    """Parse GRIB_VALID_TIME metadata into a Unix epoch integer, or -1."""
+    raw = meta.get('GRIB_VALID_TIME') or meta.get('valid_time') or ''
+    m = re.search(r'(\d{9,})', str(raw))
+    return int(m.group(1)) if m else -1
+
+
+def _convert_grib_to_netcdf(grib_path: Path, nc_path: Path) -> None:
+    """Convert a GRIB file to a CF-compliant NetCDF4 file.
+
+    Variable short names extracted from GRIB metadata (via GRIB_ELEMENT WMO code)
+    are remapped to the internal ERA5 naming convention via
+    ``_GRIB_ELEMENT_TO_INTERNAL`` (e.g. '2t' -> 't2m', '100u' -> 'u100').
+    Names not listed in the mapping are kept as-is.
+    The time axis is built from GRIB_VALID_TIME epoch values found in the band
+    metadata so that the resulting file is directly compatible with
+    ``ERA5TimeSeriesProcessor.load_data()``.
+    """
+    ds = gdal.Open(str(grib_path), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f'Could not open GRIB file: {grib_path}')
+
+    gt = ds.GetGeoTransform()
+    x_size, y_size = ds.RasterXSize, ds.RasterYSize
+    lon = gt[0] + (np.arange(x_size, dtype=np.float64) + 0.5) * gt[1]
+    lat = gt[3] + (np.arange(y_size, dtype=np.float64) + 0.5) * gt[5]
+
+    # Collect band records grouped by internal variable name.
+    # Each entry: list of (valid_time_epoch, band_index, metadata_dict)
+    by_var = defaultdict(list)
+    all_times = set()
+
+    for idx in range(1, ds.RasterCount + 1):
+        b = ds.GetRasterBand(idx)
+        meta = b.GetMetadata() or {}
+        grib_elem = _get_grib_element(meta).lower()
+        if not grib_elem:
+            logger.warning(
+                f'Band {idx} in {grib_path} has no GRIB_ELEMENT metadata; '
+                'skipping band')
+            continue
+        # Remap GRIB_ELEMENT to internal name via case-insensitive lookup
+        internal = _GRIB_ELEMENT_TO_INTERNAL.get(grib_elem, grib_elem)
+        valid_time = _parse_valid_time_epoch(meta)
+        by_var[internal].append((valid_time, idx, meta))
+        if valid_time >= 0:
+            all_times.add(valid_time)
+
+    if not all_times:
+        raise RuntimeError(
+            f'No GRIB_VALID_TIME metadata found in {grib_path}; '
+            'cannot construct NetCDF time axis')
+
+    times = sorted(all_times)
+    time_to_idx = {t: i for i, t in enumerate(times)}
+
+    nc_path.parent.mkdir(parents=True, exist_ok=True)
+    with netCDF4.Dataset(str(nc_path), 'w', format='NETCDF4') as nc:
+        nc.createDimension('valid_time', len(times))
+        nc.createDimension('latitude', y_size)
+        nc.createDimension('longitude', x_size)
+
+        tvar = nc.createVariable('valid_time', 'i8', ('valid_time',))
+        tvar[:] = np.array(times, dtype=np.int64)
+        tvar.units = 'seconds since 1970-01-01 00:00:00'
+        tvar.calendar = 'proleptic_gregorian'
+        tvar.standard_name = 'time'
+        tvar.long_name = 'time'
+
+        yvar = nc.createVariable('latitude', 'f8', ('latitude',))
+        yvar[:] = lat
+        yvar.units = 'degrees_north'
+        yvar.standard_name = 'latitude'
+
+        xvar = nc.createVariable('longitude', 'f8', ('longitude',))
+        xvar[:] = lon
+        xvar.units = 'degrees_east'
+        xvar.standard_name = 'longitude'
+
+        for internal_name, records in sorted(by_var.items()):
+            var = nc.createVariable(
+                internal_name, 'f4',
+                ('valid_time', 'latitude', 'longitude'),
+                zlib=True, complevel=4,
+                fill_value=np.float32(np.nan),
+            )
+            data = np.full(
+                (len(times), y_size, x_size), np.nan, dtype=np.float32)
+            sample_units = None
+            sample_long_name = None
+
+            for (vt, band_idx, meta) in records:
+                if vt < 0:
+                    continue
+                b = ds.GetRasterBand(band_idx)
+                arr = b.ReadAsArray().astype(np.float32)
+                nodata = b.GetNoDataValue()
+                scale = b.GetScale() if b.GetScale() is not None else 1.0
+                offset = b.GetOffset() if b.GetOffset() is not None else 0.0
+                if nodata is not None and not np.isnan(nodata):
+                    arr[arr == nodata] = np.nan
+                arr = arr * scale + offset
+                data[time_to_idx[vt]] = arr
+                if sample_units is None:
+                    sample_units = (
+                        meta.get('GRIB_UNIT') or meta.get('units'))
+                if sample_long_name is None:
+                    sample_long_name = (
+                        meta.get('GRIB_COMMENT') or meta.get('long_name'))
+
+            var[:] = data
+            if sample_units is not None:
+                var.units = sample_units
+            if sample_long_name is not None:
+                var.long_name = sample_long_name
+
+    ds = None
 
 
 def comp_wind_speed(u100, v100):
@@ -83,19 +227,74 @@ def get_era5(date_start, date_end, downloadpath, area=None,
     if not os.path.exists(downloadpath):
 
         import cdsapi
-        s = {}
-
-        s["variable"] = variables
-        s["product_type"] = "reanalysis"
-        s["date"] = date_start+"/"+date_end
-        s["time"] = [str(t).zfill(2)+":00" for t in range(0, 24, 1)]
+        s = {
+            "variable": variables,
+            "product_type": "reanalysis",
+            "date": date_start + "/" + date_end,
+            "time": [str(t).zfill(2) + ":00" for t in range(0, 24, 1)],
+            # GRIB is currently the most robust ERA5 output format.
+            "data_format": "grib",
+            "download_format": "unarchived"
+        }
         if area is not None:
             s["area"] = area
-        s["format"] = "netcdf"
 
         # Connect to the server and download the data
         c = cdsapi.Client()
+
         c.retrieve("reanalysis-era5-single-levels", s, downloadpath)
+
+        # Normalize ZIP responses (if any) to a single asset in downloadpath.
+        with open(downloadpath, 'rb') as f:
+            magic = f.read(4)
+
+        if magic.startswith(b'PK'):
+            with zipfile.ZipFile(downloadpath, 'r') as zf:
+                nc_members = [m for m in zf.namelist()
+                              if m.lower().endswith('.nc')]
+                grib_members = [m for m in zf.namelist()
+                                if m.lower().endswith('.grib')
+                                or m.lower().endswith('.grb')]
+                members = nc_members if len(nc_members) > 0 else grib_members
+                if len(members) == 0:
+                    raise RuntimeError(
+                        f'CDS returned ZIP but no .nc/.grib file was found: '
+                        f'{downloadpath}')
+                with zf.open(members[0], 'r') as src, \
+                        open(downloadpath, 'wb') as dst:
+                    dst.write(src.read())
+
+            with open(downloadpath, 'rb') as f:
+                magic = f.read(4)
+
+        # Convert GRIB to NetCDF using the metadata-aware converter that
+        # preserves ERA5 variable names and builds a proper time axis.
+        if magic.startswith(b'GRIB'):
+            grib_path = Path(downloadpath).with_suffix('.grib')
+            os.replace(downloadpath, str(grib_path))
+            logger.info(
+                'CDS returned GRIB; converting to NetCDF with '
+                'metadata-aware conversion: {}', grib_path)
+            _convert_grib_to_netcdf(grib_path, Path(downloadpath))
+
+        # Fail fast if retrieval succeeded but did not return a valid NetCDF file.
+        try:
+            nc = netCDF4.Dataset(downloadpath, 'r')
+            nc.close()
+        except Exception as e:
+            kind = 'unknown'
+            with open(downloadpath, 'rb') as f:
+                head = f.read(64)
+            if head.startswith(b'{') or head.startswith(b'['):
+                kind = 'json'
+            elif head.lower().startswith(b'<!doctype') or head.lower().startswith(b'<html'):
+                kind = 'html'
+            elif head.startswith(b'GRIB'):
+                kind = 'grib'
+            raise RuntimeError(
+                f'Invalid NetCDF output at {downloadpath}. '
+                f'Detected payload kind: {kind}. '
+                'Verify CDS credentials/terms and file conversion.') from e
 
 
 class ERA5Collection(DiskCollection):
